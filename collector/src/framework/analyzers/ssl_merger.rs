@@ -77,10 +77,12 @@ impl SSLMerger {
             return body.ends_with("0\r\n\r\n") || body.contains("\r\n0\r\n\r\n");
         } else {
             // For non-chunked, check Content-Length
-            if let Some(cl_start) = headers.to_lowercase().find("content-length:") {
-                let cl_line = &headers[cl_start..];
-                if let Some(cl_end) = cl_line.find("\r\n") {
-                    let cl_value = &cl_line[15..cl_end].trim();
+            // Parse headers line-by-line to avoid false matches (e.g., X-Content-Length)
+            for line in headers.split("\r\n") {
+                let line_lower = line.to_lowercase();
+                if line_lower.starts_with("content-length:") {
+                    let value_start = "content-length:".len();
+                    let cl_value = line[value_start..].trim();
                     if let Ok(content_length) = cl_value.parse::<usize>() {
                         return body.len() >= content_length;
                     }
