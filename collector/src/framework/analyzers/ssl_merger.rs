@@ -104,9 +104,17 @@ impl SSLMerger {
         // Update the data field with accumulated content
         if let Some(data) = merged_event.data.as_object_mut() {
             data.insert("data".to_string(), serde_json::json!(buffer.accumulated_data));
-            data.insert("len".to_string(), serde_json::json!(buffer.accumulated_data.len()));
+            // Preserve the original "len" (which represents the original byte length)
+            // and record the merged payload length separately.
+            data.insert(
+                "merged_len_bytes".to_string(),
+                serde_json::json!(buffer.accumulated_data.len()),
+            );
             data.insert("merged_events".to_string(), serde_json::json!(buffer.event_count));
-            data.insert("first_timestamp_ns".to_string(), serde_json::json!(buffer.first_timestamp));
+            data.insert(
+                "first_timestamp_ns".to_string(),
+                serde_json::json!(buffer.first_timestamp),
+            );
         }
 
         // Use the timestamp from the last event
