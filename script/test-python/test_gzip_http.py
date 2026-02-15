@@ -14,7 +14,8 @@ class GzipHandler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
         # Read request body
         content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length) if content_length > 0 else b''
+        if content_length > 0:
+            self.rfile.read(content_length)
 
         # Create response
         response_data = {
