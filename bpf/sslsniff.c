@@ -16,12 +16,13 @@
 #include <locale.h>
 #include <wchar.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
 #include "sslsniff.skel.h"
 #include "sslsniff.h"
+#include "container_info.h"
+#include "jsonl.h"
 
 #define INVALID_UID -1
 #define INVALID_PID -1
@@ -37,9 +38,14 @@
 
 #define __CHECK_PROGRAM(skel, prog_name)               \
 	do {                                               \
+	  long __err = libbpf_get_error(skel->links.prog_name); \
+	  if (__err) {                                     \
+		skel->links.prog_name = NULL;                  \
+		return (int)__err;                             \
+	  }                                                \
 	  if (!skel->links.prog_name) {                    \
 		perror("no program attached for " #prog_name); \
-		return -errno;                                 \
+		return -(errno ? errno : ENOENT);              \
 	  }                                                \
 	} while (false)
 
@@ -99,6 +105,7 @@ const char argp_program_doc[] =
 
 struct env {
 	pid_t pid;
+	pid_t session_id;
 	int uid;
 	char *comm;
 	bool openssl;
@@ -109,6 +116,7 @@ struct env {
 } env = {
 	.uid = INVALID_UID,
 	.pid = INVALID_PID,
+	.session_id = INVALID_PID,
 	.openssl = true,
 	.gnutls = false,
 	.nss = false,
@@ -117,9 +125,11 @@ struct env {
 };
 
 #define EXTRA_LIB_KEY 1003
+#define SESSION_KEY 1004
 
 static const struct argp_option opts[] = {
 	{"pid", 'p', "PID", 0, "Sniff this PID only."},
+	{"session", SESSION_KEY, "SID", 0, "Sniff this process session only."},
 	{"uid", 'u', "UID", 0, "Sniff this UID only."},
 	{"comm", 'c', "COMMAND", 0, "Sniff only commands matching string."},
 	{"no-openssl", 'o', NULL, 0, "Do not show OpenSSL calls."},
@@ -165,6 +175,7 @@ static struct boringssl_offsets find_boringssl_offsets(const char *binary_path) 
 	int fd = -1;
 	struct stat st;
 	unsigned char *data = NULL;
+	size_t file_size;
 
 	/* BoringSSL SSL_do_handshake prologue (24 bytes) */
 	static const unsigned char handshake_pat[] = {
@@ -204,15 +215,40 @@ static struct boringssl_offsets find_boringssl_offsets(const char *binary_path) 
 		return result;
 	}
 
-	data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-	if (data == MAP_FAILED) {
-		fprintf(stderr, "Failed to mmap %s: %s\n", binary_path, strerror(errno));
+	if (st.st_size <= 0) {
+		fprintf(stderr, "Invalid binary size for %s\n", binary_path);
 		close(fd);
 		return result;
 	}
+	file_size = (size_t)st.st_size;
+
+	data = malloc(file_size);
+	if (!data) {
+		fprintf(stderr, "Failed to allocate %zu bytes for %s\n", file_size, binary_path);
+		close(fd);
+		return result;
+	}
+	size_t total = 0;
+	while (total < file_size) {
+		ssize_t n = read(fd, data + total, file_size - total);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "Failed to read %s: %s\n", binary_path, strerror(errno));
+			goto out;
+		}
+		if (n == 0)
+			break;
+		total += (size_t)n;
+	}
+	if (total != file_size) {
+		fprintf(stderr, "Short read from %s: %zu of %zu bytes\n",
+				binary_path, total, file_size);
+		goto out;
+	}
 
 	/* Find SSL_read (most unique pattern), then validate nearby functions */
-	size_t read_off = find_pattern(data, st.st_size, read_pat, sizeof(read_pat));
+	size_t read_off = find_pattern(data, file_size, read_pat, sizeof(read_pat));
 	if (read_off == (size_t)-1) {
 		if (verbose)
 			fprintf(stderr, "BoringSSL: SSL_read pattern not found\n");
@@ -228,7 +264,7 @@ static struct boringssl_offsets find_boringssl_offsets(const char *binary_path) 
 	}
 	if (result.ssl_do_handshake == 0) {
 		/* Fallback: search independently */
-		size_t hs_off = find_pattern(data, st.st_size, handshake_pat, sizeof(handshake_pat));
+		size_t hs_off = find_pattern(data, file_size, handshake_pat, sizeof(handshake_pat));
 		if (hs_off == (size_t)-1) {
 			if (verbose)
 				fprintf(stderr, "BoringSSL: SSL_do_handshake pattern not found\n");
@@ -241,15 +277,17 @@ static struct boringssl_offsets find_boringssl_offsets(const char *binary_path) 
 
 	/* Check if SSL_write is at expected relative position */
 	size_t expected_wr = read_off + WRITE_READ_DELTA;
-	if (expected_wr + sizeof(write_pat) <= (size_t)st.st_size &&
+	if (expected_wr + sizeof(write_pat) <= file_size &&
 		memcmp(data + expected_wr, write_pat, sizeof(write_pat)) == 0) {
 		result.ssl_write = expected_wr;
 	} else {
-		/* Fallback: search near read function */
-		size_t search_start = read_off;
+		/* Fallback: search near read function. Some standalone Bun apps
+		 * place SSL_write before SSL_read even though Claude/Bun place it
+		 * after SSL_read. */
+		size_t search_start = read_off > 0x10000 ? read_off - 0x10000 : 0;
 		size_t search_end = read_off + 0x10000;
-		if (search_end > (size_t)st.st_size)
-			search_end = st.st_size;
+		if (search_end > file_size)
+			search_end = file_size;
 		size_t wr_off = find_pattern(data + search_start,
 									 search_end - search_start,
 									 write_pat, sizeof(write_pat));
@@ -270,7 +308,7 @@ static struct boringssl_offsets find_boringssl_offsets(const char *binary_path) 
 	}
 
 out:
-	munmap(data, st.st_size);
+	free(data);
 	close(fd);
 	return result;
 }
@@ -279,6 +317,14 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state) {
 	switch (key) {
 	case 'p':
 		env.pid = atoi(arg);
+		break;
+	case SESSION_KEY:
+		errno = 0;
+		env.session_id = (pid_t)strtol(arg, NULL, 10);
+		if (errno || env.session_id <= 0) {
+			fprintf(stderr, "Invalid session id: %s\n", arg);
+			argp_usage(state);
+		}
 		break;
 	case 'u':
 		env.uid = atoi(arg);
@@ -393,6 +439,7 @@ int attach_openssl_by_offset(struct sslsniff_bpf *skel, const char *lib,
 	return 0;
 }
 
+
 /*
  * Find the path of a library using ldconfig.
  */
@@ -433,62 +480,6 @@ char *find_library_path(const char *libname) {
 // Global buffer allocated once and reused
 static char *event_buf = NULL;
 
-// Function to validate UTF-8 sequence and return its length
-// Returns 0 if invalid, otherwise returns the number of bytes in the sequence
-int validate_utf8_char(const unsigned char *str, size_t remaining) {
-	if (!str || remaining == 0) return 0;
-	
-	unsigned char c = str[0];
-	
-	// ASCII character (0-127)
-	if (c < 0x80) return 1;
-	
-	// Determine the expected length of UTF-8 sequence
-	int expected_len = 0;
-	if ((c & 0xE0) == 0xC0) expected_len = 2;      // 110xxxxx
-	else if ((c & 0xF0) == 0xE0) expected_len = 3; // 1110xxxx
-	else if ((c & 0xF8) == 0xF0) expected_len = 4; // 11110xxx
-	else return 0; // Invalid start byte
-	
-	// Check if we have enough bytes
-	if (remaining < expected_len) return 0;
-	
-	// Create a buffer for mbstowcs
-	char temp[5] = {0};
-	for (int i = 0; i < expected_len && i < 4; i++) {
-		temp[i] = str[i];
-	}
-	
-	// Set locale for UTF-8 (done once in main)
-	wchar_t wc;
-	mbstate_t state;
-	memset(&state, 0, sizeof(state));
-	
-	// Try to convert the sequence
-	size_t result = mbrtowc(&wc, temp, expected_len, &state);
-	
-	// Check for conversion errors
-	if (result == (size_t)-1 || result == (size_t)-2 || result == 0) {
-		return 0; // Invalid sequence
-	}
-	
-	// Additional validation for overlong sequences and valid code points
-	if (expected_len == 2) {
-		unsigned int codepoint = ((c & 0x1F) << 6) | (str[1] & 0x3F);
-		if (codepoint < 0x80) return 0; // Overlong
-	} else if (expected_len == 3) {
-		unsigned int codepoint = ((c & 0x0F) << 12) | ((str[1] & 0x3F) << 6) | (str[2] & 0x3F);
-		if (codepoint < 0x800) return 0; // Overlong
-		if (codepoint >= 0xD800 && codepoint <= 0xDFFF) return 0; // Surrogate
-	} else if (expected_len == 4) {
-		unsigned int codepoint = ((c & 0x07) << 18) | ((str[1] & 0x3F) << 12) | 
-		                        ((str[2] & 0x3F) << 6) | (str[3] & 0x3F);
-		if (codepoint < 0x10000 || codepoint > 0x10FFFF) return 0; // Invalid range
-	}
-	
-	return expected_len;
-}
-
 // Function to print the event from the perf buffer in JSON format
 void print_event(struct probe_SSL_data_t *event, const char *evt) {
 	static unsigned long long start = 0;  // Use static to retain value across function calls
@@ -516,6 +507,9 @@ void print_event(struct probe_SSL_data_t *event, const char *evt) {
 	}
 
 	if (env.comm && strcmp(env.comm, event->comm) != 0) {
+		return;
+	}
+	if (env.session_id > 0 && getsid(event->pid) != env.session_id) {
 		return;
 	}
 
@@ -557,46 +551,10 @@ void print_event(struct probe_SSL_data_t *event, const char *evt) {
 	// Data field - always include both text and hex
 	if (buf_size > 0) {
 		// Text data
-		printf("\"data\":\"");
-		for (unsigned int i = 0; i < buf_size; i++) {
-			unsigned char c = event_buf[i];
-			if (c == '"' || c == '\\') {
-				printf("\\%c", c);
-			} else if (c == '\n') {
-				printf("\\n");
-			} else if (c == '\r') {
-				printf("\\r");
-			} else if (c == '\t') {
-				printf("\\t");
-			} else if (c == '\b') {
-				printf("\\b");
-			} else if (c == '\f') {
-				printf("\\f");
-			} else if (c >= 32 && c <= 126) {
-				// ASCII printable characters
-				printf("%c", c);
-			} else if (c >= 128) {
-				// Use our new UTF-8 validation function
-				int utf8_len = validate_utf8_char((unsigned char *)&event_buf[i], buf_size - i);
-				
-				if (utf8_len > 0) {
-					// Output the valid UTF-8 sequence
-					for (int j = 0; j < utf8_len; j++) {
-						printf("%c", event_buf[i + j]);
-					}
-					i += utf8_len - 1; // Skip the continuation bytes
-				} else {
-					// Invalid UTF-8 byte - escape it
-					printf("\\u%04x", c);
-				}
-			} else {
-				// Control characters (0-31, 127)
-				printf("\\u%04x", c);
-			}
-		}
-		printf("\",");
-		
-		
+		printf("\"data\":");
+		json_print_escaped_quoted(event_buf, buf_size);
+		printf(",");
+
 		// Add truncated info if data was truncated
 		if (buf_size < event->len) {
 			printf("\"truncated\":true,\"bytes_lost\":%d", event->len - buf_size);
@@ -606,6 +564,9 @@ void print_event(struct probe_SSL_data_t *event, const char *evt) {
 	} else {
 		printf("\"data\":null,\"truncated\":false");
 	}
+
+	// Container info (ns_pid, container_id) if applicable
+	print_container_fields(event->pid);
 
 	// Close JSON object
 	printf("}\n");
@@ -664,9 +625,10 @@ int main(int argc, char **argv) {
 
 	if (env.openssl) {
 		char *openssl_path = find_library_path("libssl.so");
-		if (verbose) {
-			fprintf(stderr, "OpenSSL path: %s\n", openssl_path ? openssl_path : "not found");
-		}
+		if (verbose)
+			fprintf(stderr, "OpenSSL path (host ldconfig): %s\n",
+					openssl_path ? openssl_path : "not found");
+
 		if (openssl_path) {
 			attach_openssl(obj, openssl_path);
 		} else {
@@ -698,20 +660,33 @@ int main(int argc, char **argv) {
 
 	// Handle custom binary path for statically-linked SSL (e.g., NVM Node.js, Bun apps)
 	if (env.extra_lib) {
+		err = -ENOENT;
+
 		if (verbose) {
 			fprintf(stderr, "Attaching to binary: %s\n", env.extra_lib);
+		}
+		if (access(env.extra_lib, R_OK) != 0) {
+			err = -errno;
+			warn("Cannot access binary-path %s: %s\n",
+				 env.extra_lib, strerror(errno));
+			goto cleanup;
 		}
 		// First try symbol-based attachment (works for binaries with symbols)
 		LIBBPF_OPTS(bpf_uprobe_opts, test_opts, .func_name = "SSL_write",
 					.retprobe = false);
 		struct bpf_link *test_link = bpf_program__attach_uprobe_opts(
 			obj->progs.probe_SSL_rw_enter, env.pid, env.extra_lib, 0, &test_opts);
-		if (test_link) {
+		long test_err = test_link ? libbpf_get_error(test_link) : -(errno ? errno : EIO);
+		if (test_link && !test_err) {
 			// Symbol found - use standard symbol-based attachment
 			bpf_link__destroy(test_link);
 			if (verbose)
 				fprintf(stderr, "Using symbol-based attachment for %s\n", env.extra_lib);
-			attach_openssl(obj, env.extra_lib);
+			err = attach_openssl(obj, env.extra_lib);
+		} else if (test_err != -ENOENT) {
+			err = (int)test_err;
+			warn("Failed to probe SSL_write in %s: libbpf error %ld\n",
+				 env.extra_lib, test_err);
 		} else {
 			// Symbol not found - try BoringSSL pattern detection
 			if (verbose)
@@ -719,11 +694,17 @@ int main(int argc, char **argv) {
 			struct boringssl_offsets offsets = find_boringssl_offsets(env.extra_lib);
 			if (offsets.found) {
 				fprintf(stderr, "BoringSSL detected! Attaching by offset...\n");
-				attach_openssl_by_offset(obj, env.extra_lib, &offsets);
+				err = attach_openssl_by_offset(obj, env.extra_lib, &offsets);
 			} else {
 				warn("Failed to attach to %s: no SSL symbols or BoringSSL patterns found\n",
 					 env.extra_lib);
 			}
+		}
+
+		if (err) {
+			warn("binary-path attach failed for %s; refusing to continue with partial SSL capture\n",
+				 env.extra_lib);
+			goto cleanup;
 		}
 	}
 

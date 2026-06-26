@@ -31,10 +31,14 @@ CFLAGS += $(ASAN_FLAGS)
 ALL_LDFLAGS += $(ASAN_FLAGS)
 endif
 
-APPS = sslsniff browsertrace stdiocap process process_new test_process_utils test_process_filter test_process_new_map_flush test_process_new_mem_info test_process_new_header # minimal minimal_legacy uprobe kprobe fentry usdt sockfilter tc ksyscall
+APPS = sslsniff stdiocap process test_process_utils test_process_filter test_process_ext_map_flush test_process_ext_types # minimal minimal_legacy uprobe kprobe fentry usdt sockfilter tc ksyscall
+
+# Experimental programs: built only via `make experimental` (or by name), not
+# shipped in the default build or embedded into the collector.
+EXPERIMENTAL_APPS = browsertrace
 
 # All test programs (no BPF skeleton needed)
-TEST_APPS = test_process_utils test_process_filter test_process_new_map_flush test_process_new_mem_info test_process_new_header
+TEST_APPS = test_process_utils test_process_filter test_process_ext_map_flush test_process_ext_types
 
 CARGO ?= $(shell which cargo)
 ifeq ($(strip $(CARGO)),)
@@ -81,6 +85,9 @@ $(call allow-override,LD,$(CROSS_COMPILE)ld)
 .PHONY: all
 all: $(APPS)
 
+.PHONY: experimental
+experimental: $(EXPERIMENTAL_APPS)
+
 .PHONY: debug
 debug:
 	$(MAKE) ASAN=1 all
@@ -92,14 +99,15 @@ sslsniff-debug:
 .PHONY: clean
 clean:
 	$(call msg,CLEAN)
-	$(Q)rm -rf $(OUTPUT) $(APPS)
+	$(Q)rm -rf $(OUTPUT) $(APPS) $(EXPERIMENTAL_APPS)
 
 .PHONY: help
 help:
 	@echo "Available targets:"
 	@echo "  all          - Build all applications"
+	@echo "  experimental - Build experimental programs (browsertrace)"
 	@echo "  sslsniff     - Build sslsniff only"
-	@echo "  browsertrace - Build browsertrace only"
+	@echo "  browsertrace - Build browsertrace only (experimental)"
 	@echo "  stdiocap     - Build stdiocap only"
 	@echo "  process      - Build process tracer only"
 	@echo "  test         - Build and run tests"
@@ -110,25 +118,45 @@ help:
 	@echo "Build with AddressSanitizer manually:"
 	@echo "  make ASAN=1 sslsniff"
 
-.PHONY: test
-test: test_process_utils test_process_filter test_process_new_map_flush test_process_new_mem_info test_process_new_header
+.PHONY: test unit-test runtime-test
+test: unit-test
+	@$(MAKE) runtime-test
+
+unit-test: test_process_utils test_process_filter test_process_ext_map_flush test_process_ext_types
 	@echo "Running process_utils tests..."
 	@./test_process_utils
 	@echo ""
 	@echo "Running process_filter tests..."
 	@./test_process_filter
 	@echo ""
-	@echo "Running process_new map_flush tests..."
-	@./test_process_new_map_flush
+	@echo "Running process_ext map_flush tests..."
+	@./test_process_ext_map_flush
 	@echo ""
-	@echo "Running process_new mem_info tests..."
-	@./test_process_new_mem_info
+	@echo "Running process_ext types tests..."
+	@./test_process_ext_types
+
+runtime-test: process stdiocap
 	@echo ""
-	@echo "Running process_new header tests..."
-	@./test_process_new_header
+	@echo "Running process runtime tests..."
+	@if [ "$$(id -u)" -eq 0 ]; then \
+		python3 tests/test_process_runtime.py; \
+	elif sudo -n true >/dev/null 2>&1; then \
+		sudo -n env PATH="$$PATH" python3 tests/test_process_runtime.py; \
+	else \
+		echo "SKIP: process runtime tests require root or cached sudo"; \
+	fi
+	@echo ""
+	@echo "Running stdiocap runtime tests..."
+	@if [ "$$(id -u)" -eq 0 ]; then \
+		python3 tests/test_stdiocap_runtime.py; \
+	elif sudo -n true >/dev/null 2>&1; then \
+		sudo -n env PATH="$$PATH" python3 tests/test_stdiocap_runtime.py; \
+	else \
+		echo "SKIP: stdiocap runtime tests require root or cached sudo"; \
+	fi
 
 .PHONY: integration-test
-integration-test: process_new process
+integration-test: process
 	@echo "Running integration tests (requires sudo)..."
 	@sudo python3 tests/test_integration.py
 
@@ -161,8 +189,8 @@ $(LIBBLAZESYM_HEADER): $(LIBBLAZESYM_SRC)/target/release/libblazesym.a | $(OUTPU
 	$(call msg,LIB,$@)
 	$(Q)cp $(LIBBLAZESYM_SRC)/target/release/blazesym.h $@
 
-# Extra dependencies for process_new BPF (subdirectory headers)
-$(OUTPUT)/process_new.bpf.o: $(wildcard process_ext/*.h)
+# Extra dependencies for process BPF extension headers
+$(OUTPUT)/process.bpf.o: $(wildcard process_ext/*.h)
 
 # Build BPF code
 $(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(wildcard %.h) $(VMLINUX) | $(OUTPUT) $(BPFTOOL)
@@ -178,7 +206,10 @@ $(OUTPUT)/%.skel.h: $(OUTPUT)/%.bpf.o | $(OUTPUT) $(BPFTOOL)
 	$(Q)$(BPFTOOL) gen skeleton $< > $@
 
 # Build user-space code (exclude all test programs from the skel.h requirement)
-$(patsubst %,$(OUTPUT)/%.o,$(filter-out $(TEST_APPS),$(APPS))): %.o: %.skel.h
+$(patsubst %,$(OUTPUT)/%.o,$(filter-out $(TEST_APPS),$(APPS) $(EXPERIMENTAL_APPS))): %.o: %.skel.h
+
+# Shared JSONL emit helpers used by all userspace loaders
+$(patsubst %,$(OUTPUT)/%.o,$(filter-out $(TEST_APPS),$(APPS))): jsonl.h
 
 # Special rule for test programs (no BPF skeleton needed)
 $(OUTPUT)/test_process_utils.o: test_process_utils.c $(wildcard *.h) | $(OUTPUT)
@@ -189,15 +220,11 @@ $(OUTPUT)/test_process_filter.o: test_process_filter.c $(wildcard *.h) | $(OUTPU
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OUTPUT)/test_process_new_map_flush.o: tests/test_process_new_map_flush.c $(wildcard *.h) $(wildcard process_ext/*.h) | $(OUTPUT)
+$(OUTPUT)/test_process_ext_map_flush.o: tests/test_process_ext_map_flush.c $(wildcard *.h) $(wildcard process_ext/*.h) | $(OUTPUT)
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) -I. -Itests -c $< -o $@
 
-$(OUTPUT)/test_process_new_mem_info.o: tests/test_process_new_mem_info.c $(wildcard *.h) $(wildcard process_ext/*.h) | $(OUTPUT)
-	$(call msg,CC,$@)
-	$(Q)$(CC) $(CFLAGS) -I. -c $< -o $@
-
-$(OUTPUT)/test_process_new_header.o: tests/test_process_new_header.c $(wildcard *.h) $(wildcard process_ext/*.h) | $(OUTPUT)
+$(OUTPUT)/test_process_ext_types.o: tests/test_process_ext_types.c $(wildcard *.h) $(wildcard process_ext/*.h) | $(OUTPUT)
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) -I. -c $< -o $@
 
@@ -210,7 +237,7 @@ $(patsubst %,$(OUTPUT)/%.o,$(BZS_APPS)): $(LIBBLAZESYM_HEADER)
 $(BZS_APPS): $(LIBBLAZESYM_OBJ)
 
 # Build application binary (exclude all test programs)
-$(filter-out $(TEST_APPS),$(APPS)): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) | $(OUTPUT)
+$(filter-out $(TEST_APPS),$(APPS) $(EXPERIMENTAL_APPS)): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -lelf -lz -o $@
 
@@ -224,15 +251,11 @@ test_process_filter: $(OUTPUT)/test_process_filter.o | $(OUTPUT)
 	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -o $@
 
 # map_flush helper uses libbpf_num_possible_cpus() from libbpf.
-test_process_new_map_flush: $(OUTPUT)/test_process_new_map_flush.o $(LIBBPF_OBJ) | $(OUTPUT)
+test_process_ext_map_flush: $(OUTPUT)/test_process_ext_map_flush.o $(LIBBPF_OBJ) | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -lelf -lz -o $@
 
-test_process_new_mem_info: $(OUTPUT)/test_process_new_mem_info.o | $(OUTPUT)
-	$(call msg,BINARY,$@)
-	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -o $@
-
-test_process_new_header: $(OUTPUT)/test_process_new_header.o | $(OUTPUT)
+test_process_ext_types: $(OUTPUT)/test_process_ext_types.o | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -o $@
 

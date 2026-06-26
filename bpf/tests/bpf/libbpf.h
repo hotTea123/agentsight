@@ -6,4 +6,9 @@
 #define LIBBPF_API
 #endif
 
+static inline int libbpf_num_possible_cpus(void)
+{
+	return 1;
+}
+
 #endif /* __LIBBPF_LIBBPF_H */

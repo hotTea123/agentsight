@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
-#ifndef __PROCESS_NEW_BPF_COW_H
-#define __PROCESS_NEW_BPF_COW_H
+#ifndef __PROCESS_EXT_BPF_COW_H
+#define __PROCESS_EXT_BPF_COW_H
 
 /*
  * CoW page fault tracing via kprobe on do_wp_page.
@@ -25,4 +25,4 @@ int trace_cow_fault(struct pt_regs *ctx)
 	return 0;
 }
 
-#endif /* __PROCESS_NEW_BPF_COW_H */
+#endif /* __PROCESS_EXT_BPF_COW_H */

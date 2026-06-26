@@ -4,8 +4,7 @@
 'use client';
 
 import { useState, useMemo, useEffect, useCallback } from 'react';
-import { Event, ProcessedEvent } from '@/types/event';
-import { processEvents, filterEvents, formatDuration } from '@/utils/eventProcessing';
+import { DisplayEvent, filterDisplayEvents, formatDuration } from '@/utils/eventProcessing';
 import { EventFilters } from '@/components/common/EventFilters';
 import { EventModal } from '@/components/common/EventModal';
 import { ZoomControls } from './ZoomControls';
@@ -13,41 +12,40 @@ import { TimelineAxis } from './TimelineAxis';
 import { TimelineMinimap } from './TimelineMinimap';
 import { TimelineGroup } from './TimelineGroup';
 import { TimelineScrollBar } from './TimelineScrollBar';
+import { useTranslation } from '@/i18n';
 
 interface TimelineProps {
-  events: Event[];
+  events: DisplayEvent[];
 }
 
 interface TimelineGroupData {
   source: string;
-  events: ProcessedEvent[];
+  events: DisplayEvent[];
   color: string;
 }
 
 export function Timeline({ events }: TimelineProps) {
-  const [selectedEvent, setSelectedEvent] = useState<ProcessedEvent | null>(null);
+  const [selectedEvent, setSelectedEvent] = useState<DisplayEvent | null>(null);
   const [timeRange, setTimeRange] = useState<{ start: number; end: number } | null>(null);
   const [selectedSource, setSelectedSource] = useState<string>('');
   const [selectedComm, setSelectedComm] = useState<string>('');
   const [selectedPid, setSelectedPid] = useState<string>('');
   const [zoomLevel, setZoomLevel] = useState<number>(1);
   const [scrollOffset, setScrollOffset] = useState<number>(0);
-
-  // Process events with additional metadata
-  const processedEvents = useMemo(() => processEvents(events), [events]);
+  const { t } = useTranslation();
 
   // Filter events based on selected filters
   const filteredEvents = useMemo(() => {
-    return filterEvents(processedEvents, {
+    return filterDisplayEvents(events, {
       source: selectedSource,
       comm: selectedComm,
       pid: selectedPid
     });
-  }, [processedEvents, selectedSource, selectedComm, selectedPid]);
+  }, [events, selectedSource, selectedComm, selectedPid]);
 
   // Group filtered events by source
   const timelineGroups: TimelineGroupData[] = useMemo(() => {
-    const grouped: { [source: string]: ProcessedEvent[] } = {};
+    const grouped: { [source: string]: DisplayEvent[] } = {};
     filteredEvents.forEach(event => {
       if (!grouped[event.source]) {
         grouped[event.source] = [];
@@ -208,7 +206,7 @@ export function Timeline({ events }: TimelineProps) {
       {/* Timeline Header */}
       <div className="border-b border-gray-200 p-4">
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold text-gray-900">Timeline View</h2>
+          <h2 className="text-lg font-semibold text-gray-900">{t('timeline.title')}</h2>
           <div className="flex items-center gap-4">
             <ZoomControls
               zoomLevel={zoomLevel}
@@ -219,24 +217,24 @@ export function Timeline({ events }: TimelineProps) {
               onScrollRight={scrollRight}
             />
             <div className="text-sm text-gray-600">
-              Duration: {formatDuration(baseTimeSpan)} • {filteredEvents.length} events
+              {t('timeline.durationInfo', { duration: formatDuration(baseTimeSpan), count: filteredEvents.length })}
             </div>
           </div>
         </div>
         
         {/* Zoom Help Text */}
         <div className="text-xs text-gray-500 mb-2">
-          Use mouse wheel + Ctrl/Cmd to zoom, or Ctrl/Cmd + +/- keys. Press Ctrl/Cmd + 0 to reset.
+          {t('timeline.zoomHelp')}
           {zoomLevel > 1 && (
             <span className="ml-2 text-blue-600">
-              Scroll with mouse wheel or arrow keys when zoomed.
+              {t('timeline.scrollHelp')}
             </span>
           )}
         </div>
         
         {/* Filters */}
-        <EventFilters
-          events={processedEvents}
+          <EventFilters
+          events={events}
           selectedSource={selectedSource}
           selectedComm={selectedComm}
           selectedPid={selectedPid}
@@ -246,11 +244,12 @@ export function Timeline({ events }: TimelineProps) {
         />
       </div>
 
-      {/* Timeline */}
-      <div className="p-4" onWheel={handleWheel}>
+      {/* Timeline (clip horizontal overflow from edge axis labels and hover
+          tooltips; zoom is wheel-driven, not native scroll, so this is safe) */}
+      <div className="p-4 overflow-x-clip" onWheel={handleWheel}>
         {timelineGroups.length === 0 ? (
           <div className="text-center text-gray-500 py-8">
-            No events to display
+            {t('timeline.noEvents')}
           </div>
         ) : (
           <div className="space-y-6">
@@ -297,11 +296,11 @@ export function Timeline({ events }: TimelineProps) {
         )}
       </div>
 
-      {/* Event Details Modal */}
+      {/* Event details modal */}
       <EventModal
         event={selectedEvent}
         onClose={() => setSelectedEvent(null)}
-        title="Timeline Event Details"
+        title={t('timeline.eventDetails')}
       />
     </div>
   );

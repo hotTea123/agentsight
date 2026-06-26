@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 #include <vmlinux.h>
+#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include "stdiocap.h"
@@ -23,18 +24,57 @@ struct {
 	__type(value, struct io_args_t);
 } io_args SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u32);
+	__type(value, __u64);
+} tracked_pids SEC(".maps");
+
 const volatile __u32 targ_pid = 0;
 const volatile __u32 targ_uid = 0xffffffffU;
 const volatile bool trace_stdio_only = true;
 const volatile __u32 max_capture_bytes = MAX_BUF_SIZE;
+const volatile bool use_tracked_pids = false;
+
+static __always_inline bool tracked_or_descendant(__u32 pid)
+{
+	struct task_struct *task;
+	__u64 present = 1;
+
+	if (bpf_map_lookup_elem(&tracked_pids, &pid))
+		return true;
+
+	task = (struct task_struct *)bpf_get_current_task();
+#pragma unroll
+	for (int i = 0; i < 8; i++) {
+		struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+		__u32 ppid;
+
+		if (!parent)
+			break;
+		ppid = BPF_CORE_READ(parent, tgid);
+		if (!ppid || ppid == pid)
+			break;
+		if (bpf_map_lookup_elem(&tracked_pids, &ppid)) {
+			bpf_map_update_elem(&tracked_pids, &pid, &present, BPF_ANY);
+			return true;
+		}
+		task = parent;
+	}
+
+	return false;
+}
 
 static __always_inline bool trace_allowed(__u32 uid, __u32 pid, int fd)
 {
-	if (targ_pid && targ_pid != pid)
-		return false;
 	if (targ_uid != 0xffffffffU && targ_uid != uid)
 		return false;
 	if (trace_stdio_only && (fd < 0 || fd > 2))
+		return false;
+	if (use_tracked_pids)
+		return tracked_or_descendant(pid);
+	if (targ_pid && targ_pid != pid)
 		return false;
 	return true;
 }

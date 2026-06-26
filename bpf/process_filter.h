@@ -8,7 +8,7 @@
 #include "process.h"
 
 /* Hash table for tracking PIDs in userspace */
-#define TRACKED_PIDS_HASH_SIZE 2048
+#define TRACKED_PIDS_HASH_SIZE 4096
 #define TRACKED_PIDS_HASH_MASK (TRACKED_PIDS_HASH_SIZE - 1)
 
 struct tracked_pid_entry {

@@ -1,6 +1,6 @@
 # Usage
 
-**English** | [中文](usage.zh-CN.md)
+**English** | [中文](https://github.com/eunomia-bpf/agentsight/blob/master/docs/usage.zh-CN.md)
 
 ## Building from Source
 
@@ -42,18 +42,37 @@ make build-rust      # Rust collector only
 make build-frontend  # Frontend only
 ```
 
-## Command-line parameters for monitoring Claude Code with agentsight
+## Running from Source
 
-Navigate to the source code root directory and run the following commands to test:
-
-```sh
-sudo ./collector/target/release/agentsight ssl --http-parser --http-filter "request.path_prefix=/v1/rgstr | response.status_code=202 | request.method=HEAD | response.body=" --ssl-filter "data=0\r\n\r\n"
-```
+Navigate to the repository root after `make build`. Commands that load eBPF
+probes should be run with `sudo`; AgentSight can request sudo if you forget, but
+explicit sudo is the recommended path.
 
 ```sh
-sudo ./collector/target/release/agentsight agent -c "claude" --http-parser --http-filter "request.path_prefix=/v1/rgstr | response.status_code=202 | request.method=HEAD | response.body=" --ssl-filter "data=0\r\n\r\n"
+# Live view of local agent sessions
+sudo ./collector/target/release/agentsight top
+
+# Launch and record a command
+sudo ./collector/target/release/agentsight record -- claude
+
+# Inspect the latest saved run
+./collector/target/release/agentsight report
+
+# Attach to an already-running process family
+sudo ./collector/target/release/agentsight record -c claude
+
+# Debug-level configurable tracing
+sudo ./collector/target/release/agentsight debug trace --server -c claude
+
+# Raw SSL debug capture with HTTP parsing
+sudo ./collector/target/release/agentsight debug ssl --http-parser
 ```
 
-```sh
-sudo ./collector/target/release/agentsight agent -c claude --http-filter "request.path_prefix=/v1/rgstr | response.status_code=202 | request.method=HEAD | response.body=" --ssl-filter "data=0\r\n\r\n|data.type=binary"
-```
+Use `top` for the normal live view. Use `record` when you want a durable
+agent-run artifact; it starts SSL, process, system, and web-view collection with
+AgentSight's default filters, and saves a local SQLite session for `report`,
+`top --db`, `report prompts`, and other report queries.
+
+Use `debug trace` only when you need low-level control over capture sources or
+filters. It is the advanced replacement for a raw trace command, not the normal
+record/report workflow.

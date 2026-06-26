@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 eunomia-bpf org.
 """
-Integration tests for the process_new eBPF tracer.
+Integration tests for the process eBPF tracer.
 
 Requires root privileges (sudo python3 tests/test_integration.py).
 """
@@ -17,17 +17,20 @@ import socket
 import sys
 
 BPF_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROCESS_NEW = os.path.join(BPF_DIR, "process_new")
-PROCESS_OLD = os.path.join(BPF_DIR, "process")
+PROCESS = os.path.join(BPF_DIR, "process")
+
+
+def seed_pid_arg(pid):
+    return ["--seed-pid", f"{pid}:0"]
 
 
 class TracerSession:
-    """Start process_new in background, collect JSON output."""
+    """Start process in background, collect JSON output."""
 
     def __init__(self, *extra_args, wait_attach=2):
         self.outfile = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
         self.proc = subprocess.Popen(
-            [PROCESS_NEW] + list(extra_args),
+            [PROCESS] + list(extra_args),
             stdout=self.outfile,
             stderr=subprocess.DEVNULL,
         )
@@ -172,7 +175,7 @@ def test_pid_filter():
     target_proc = subprocess.Popen(["sleep", "30"])
     target_pid = target_proc.pid
     try:
-        sess = TracerSession("-m", "0", "-p", str(target_pid))
+        sess = TracerSession("-m", "0", "-p", str(target_pid), *seed_pid_arg(target_pid))
         try:
             # Run something unrelated
             subprocess.run(["echo", "unrelated"])
@@ -573,72 +576,6 @@ def test_multi_app():
         sess.cleanup()
 
 
-def test_compat():
-    """Compare process and process_new output fields (process_new should be superset)."""
-    print("test_compat: process_new EXEC/EXIT fields are superset of process fields")
-    if not os.path.exists(PROCESS_OLD):
-        print(f"  [SKIP] Old binary not found at {PROCESS_OLD}")
-        return
-
-    def collect_events(binary, *extra_args):
-        outfile = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
-        proc = subprocess.Popen(
-            [binary] + list(extra_args),
-            stdout=outfile,
-            stderr=subprocess.DEVNULL,
-        )
-        time.sleep(2)
-        subprocess.run(["/bin/echo", "compat_test"], capture_output=True)
-        time.sleep(1)
-        proc.send_signal(signal.SIGINT)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        outfile.close()
-        events = []
-        with open(outfile.name) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        events.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-        os.unlink(outfile.name)
-        return events
-
-    old_events = collect_events(PROCESS_OLD, "-m", "0")
-    new_events = collect_events(PROCESS_NEW, "-m", "0")
-
-    # Get field sets from EXEC events
-    old_exec_fields = set()
-    for e in old_events:
-        if e.get("event") == "EXEC":
-            old_exec_fields.update(e.keys())
-            break
-
-    new_exec_fields = set()
-    for e in new_events:
-        if e.get("event") == "EXEC":
-            new_exec_fields.update(e.keys())
-            break
-
-    print(f"  [INFO] Old EXEC fields: {old_exec_fields}")
-    print(f"  [INFO] New EXEC fields: {new_exec_fields}")
-
-    missing = old_exec_fields - new_exec_fields
-    assert len(missing) == 0, (
-        f"FAIL: process_new EXEC missing fields from process: {missing}"
-    )
-    print(f"  [PASS] process_new EXEC fields are superset of process fields")
-
-    extra_fields = new_exec_fields - old_exec_fields
-    if extra_fields:
-        print(f"  [INFO] process_new has additional fields: {extra_fields}")
-
-
 def test_summary_json_schema():
     """Verify each SUMMARY event has correct field types."""
     print("test_summary_json_schema: SUMMARY event field type validation")
@@ -846,96 +783,6 @@ def test_idempotent():
     print(f"  [PASS] Both sessions succeeded")
 
 
-def test_trace_resources():
-    """--trace-resources outputs RESOURCE_SAMPLE events with valid fields."""
-    print("test_trace_resources: RESOURCE_SAMPLE event with memory/CPU stats")
-    # Start a long-running process and pass its PID with -p
-    target = subprocess.Popen(
-        ["python3", "-c", "import time; time.sleep(10)"]
-    )
-    time.sleep(0.5)  # let it start
-    sess = TracerSession("-m", "2", "-p", str(target.pid), "--trace-resources")
-    try:
-        time.sleep(3)  # need at least 2 samples
-        target.terminate()
-        target.wait()
-        time.sleep(1)
-        sess.stop()
-
-        samples = sess.find(event="RESOURCE_SAMPLE")
-        assert len(samples) >= 2, (
-            f"FAIL: Expected >=2 RESOURCE_SAMPLE, got {len(samples)}"
-        )
-        print(f"  [PASS] Got {len(samples)} RESOURCE_SAMPLE events")
-
-        # Validate fields
-        s = samples[0]
-        assert "total_rss_kb" in s, "FAIL: missing total_rss_kb"
-        assert "total_cpu_user_ms" in s, "FAIL: missing total_cpu_user_ms"
-        assert "total_cpu_sys_ms" in s, "FAIL: missing total_cpu_sys_ms"
-        assert "num_processes" in s, "FAIL: missing num_processes"
-        assert s["total_rss_kb"] > 0, "FAIL: total_rss_kb should be > 0"
-        assert s["num_processes"] > 0, "FAIL: num_processes should be > 0"
-        assert s["target_pid"] == target.pid, "FAIL: target_pid mismatch"
-        print(f"  [PASS] RESOURCE_SAMPLE has valid fields "
-              f"(rss={s['total_rss_kb']/1024:.0f}MB, procs={s['num_processes']}, "
-              f"target_pid={s['target_pid']})")
-
-        # Check cgroup fields (may or may not be present)
-        if "cgroup_memory_bytes" in s:
-            assert s["cgroup_memory_bytes"] > 0, "FAIL: cgroup_memory_bytes should be > 0"
-            print(f"  [PASS] Cgroup stats present (memory={s['cgroup_memory_bytes']/(1024*1024):.0f}MB)")
-        else:
-            print(f"  [INFO] No cgroup stats (OK if cgroup v2 not available)")
-    finally:
-        try:
-            target.kill()
-        except ProcessLookupError:
-            pass
-        sess.cleanup()
-
-
-def test_resource_detail():
-    """--resource-detail outputs per-process RESOURCE_DETAIL events."""
-    print("test_resource_detail: per-process RESOURCE_DETAIL events")
-    sess = TracerSession("-c", "python3", "--trace-resources", "--resource-detail")
-    try:
-        # Run python3 with some memory allocation
-        proc = subprocess.Popen(
-            ["python3", "-c", "x = bytearray(10*1024*1024); import time; time.sleep(3)"]
-        )
-        time.sleep(4)
-        proc.wait()
-        time.sleep(1)
-        sess.stop()
-
-        details = sess.find(event="RESOURCE_DETAIL")
-        # Should have at least one RESOURCE_DETAIL for python3
-        py_details = [d for d in details if d.get("comm") == "python3"]
-        assert len(py_details) > 0, (
-            f"FAIL: Expected RESOURCE_DETAIL for python3, got 0 "
-            f"(total details: {len(details)})"
-        )
-        print(f"  [PASS] Got {len(py_details)} RESOURCE_DETAIL for python3")
-
-        # Validate fields
-        d = py_details[0]
-        assert "pid" in d, "FAIL: missing pid"
-        assert "rss_kb" in d, "FAIL: missing rss_kb"
-        assert "cpu_user_ms" in d, "FAIL: missing cpu_user_ms"
-        assert "cpu_sys_ms" in d, "FAIL: missing cpu_sys_ms"
-        assert d["rss_kb"] > 0, "FAIL: python3 rss_kb should be > 0"
-        print(f"  [PASS] RESOURCE_DETAIL has valid fields "
-              f"(pid={d['pid']}, rss={d['rss_kb']/1024:.1f}MB)")
-
-        # Also check that RESOURCE_SAMPLE aggregate is present
-        samples = sess.find(event="RESOURCE_SAMPLE")
-        assert len(samples) > 0, "FAIL: Expected RESOURCE_SAMPLE alongside detail"
-        print(f"  [PASS] RESOURCE_SAMPLE also present ({len(samples)} events)")
-    finally:
-        sess.cleanup()
-
-
 # ---------------------------------------------------------------------------
 # Test runner
 # ---------------------------------------------------------------------------
@@ -954,14 +801,11 @@ ALL_TESTS = [
     test_file_open,
     test_trace_all,
     test_multi_app,
-    test_compat,
     test_summary_json_schema,
     test_flush_on_sigint,
     test_trace_mem,
     test_duration_filter,
     test_idempotent,
-    test_trace_resources,
-    test_resource_detail,
 ]
 
 
@@ -970,9 +814,9 @@ def main():
         print("ERROR: Integration tests require root privileges (run with sudo).")
         sys.exit(1)
 
-    if not os.path.exists(PROCESS_NEW):
-        print(f"ERROR: process_new binary not found at {PROCESS_NEW}")
-        print("Run 'make process_new' in the bpf directory first.")
+    if not os.path.exists(PROCESS):
+        print(f"ERROR: process binary not found at {PROCESS}")
+        print("Run 'make process' in the bpf directory first.")
         sys.exit(1)
 
     # Parse -k PATTERN for filtering tests
@@ -992,8 +836,8 @@ def main():
     failed = 0
     skipped = 0
 
-    print(f"\n=== process_new Integration Tests ===")
-    print(f"Binary: {PROCESS_NEW}")
+    print(f"\n=== process Integration Tests ===")
+    print(f"Binary: {PROCESS}")
     print(f"Running {len(tests_to_run)} tests\n")
 
     for test_fn in tests_to_run:

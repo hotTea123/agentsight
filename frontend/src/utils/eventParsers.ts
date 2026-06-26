@@ -1,603 +1,210 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 eunomia-bpf org.
 
-import { Event } from '@/types/event';
-import { comparePrompts } from './jsonDiff';
 import {
-  decodeStdioMessage,
-  formatStdioExpandedContent,
-  isStdioSource,
-} from './stdioParser';
+  AgentSightSnapshot,
+  SnapshotAuditEvent,
+  SnapshotProcessNode,
+} from '@/types/event';
+import { comparePrompts } from './jsonDiff';
+import { auditEventName } from './eventProcessing';
 
-// Store prompt history per process for diff comparison
-const promptHistoryByPid = new Map<number, ParsedEvent[]>();
+export type TreeEventType = 'prompt' | 'response' | 'ssl' | 'file' | 'process' | 'stdio' | 'system';
+
+export interface PromptDiff {
+  diff: string;
+  summary: string;
+  hasChanges: boolean;
+  previousPromptId?: string;
+}
+
+export type TreeAuditEvent = SnapshotAuditEvent & { promptDiff?: PromptDiff };
 
 export interface ProcessNode {
+  id: string;
   pid: number;
   comm: string;
   ppid?: number;
+  startTimestamp?: number;
+  endTimestamp?: number;
   children: ProcessNode[];
-  events: ParsedEvent[];
-  timeline: TimelineItem[]; // Mixed events and child processes in chronological order
-  isExpanded: boolean;
+  events: TreeAuditEvent[];
+  timeline: TimelineItem[];
 }
 
 export interface TimelineItem {
   type: 'event' | 'process';
   timestamp: number;
-  event?: ParsedEvent;
+  event?: TreeAuditEvent;
   process?: ProcessNode;
 }
 
-export interface ParsedEvent {
-  id: string;
-  timestamp: number;
-  type: 'prompt' | 'response' | 'ssl' | 'file' | 'process' | 'stdio' | 'system';
-  title: string;
-  content: string;
-  metadata: Record<string, any>;
-  isExpanded: boolean;
-  // For prompts, store diff with previous prompt
-  promptDiff?: {
-    diff: string;
-    summary: string;
-    hasChanges: boolean;
-    previousPromptId?: string;
-  };
-}
+export function buildProcessTree(snapshot: AgentSightSnapshot | null): ProcessNode[] {
+  const processMap = new Map<string, ProcessNode>();
+  const nodesByPid = new Map<number, ProcessNode[]>();
+  const promptHistoryByProcess = new Map<string, TreeAuditEvent[]>();
 
-export interface PromptData {
-  model?: string;
-  messages?: Array<{ 
-    role: string; 
-    content: string | Array<any> | any;
-  }>;
-  system?: Array<{ 
-    type?: string; 
-    text?: string; 
-    cache_control?: any;
-  } | string>;
-  temperature?: number;
-  max_tokens?: number;
-  stream?: boolean;
-  metadata?: {
-    user_id?: string;
-    [key: string]: any;
-  };
-}
-
-export interface ResponseData {
-  message_id?: string;
-  connection_id?: string;
-  model?: string;
-  role?: string;
-  content?: string;
-  duration_ns?: number;
-  event_count?: number;
-  function?: string;
-  has_message_start?: boolean;
-  start_time?: number;
-  end_time?: number;
-  usage?: {
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_creation_input_tokens?: number;
-    cache_read_input_tokens?: number;
-    service_tier?: string;
-  };
-  sse_events?: Array<{
-    event: string;
-    data: string;
-    parsed_data?: any;
-  }>;
-  text_content?: string;
-}
-
-export interface SSLData {
-  method?: string;
-  path?: string;
-  host?: string;
-  headers?: Record<string, string>;
-  body?: string;
-  status_code?: number;
-  content_length?: number;
-  message_type?: 'request' | 'response';
-}
-
-export interface FileData {
-  operation?: string;
-  path?: string;
-  filepath?: string;
-  event?: string;
-  size?: number;
-  permissions?: string;
-  fd?: number;
-  flags?: number;
-  count?: number;
-  pid?: number;
-  comm?: string;
-}
-
-// Utility class for safe data extraction
-class DataExtractor {
-  private data: any;
-
-  constructor(data: any) {
-    this.data = data;
+  for (const row of snapshot?.process_nodes ?? []) {
+    const process = processFromRow(row);
+    processMap.set(process.id, process);
+    nodesByPid.set(process.pid, [...(nodesByPid.get(process.pid) ?? []), process]);
   }
+  nodesByPid.forEach(nodes => nodes.sort((a, b) => firstTimestamp(a) - firstTimestamp(b)));
 
-  // Safely get nested values
-  get(path: string, defaultValue: any = undefined): any {
-    return path.split('.').reduce((obj, key) => {
-      return obj && obj[key] !== undefined ? obj[key] : defaultValue;
-    }, this.data);
-  }
+  for (const row of [...(snapshot?.audit_events ?? [])].sort((a, b) => a.timestamp_ms - b.timestamp_ms)) {
+    const process = processForAudit(row, nodesByPid);
+    if (!process) continue;
 
-  // Try to parse JSON strings safely
-  parseJson(value: any): any {
-    if (typeof value === 'string') {
-      try {
-        return JSON.parse(value);
-      } catch {
-        return value;
+    const event: TreeAuditEvent = { ...row };
+    if (treeEventType(event) === 'prompt') {
+      const history = promptHistoryByProcess.get(process.id) ?? [];
+      const previousPrompt = history[history.length - 1];
+      if (previousPrompt) {
+        event.promptDiff = {
+          ...comparePrompts(eventRaw(previousPrompt), eventRaw(event)),
+          previousPromptId: previousPrompt.id,
+        };
       }
+      promptHistoryByProcess.set(process.id, [...history, event].slice(-10));
     }
-    return value;
+    process.events.push(event);
   }
 
-  // Convert any value to readable string, pretty printing JSON
-  toString(value: any, indent = 2): string {
-    if (value === null || value === undefined) return '';
-    if (typeof value === 'string') return value;
-    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-    if (typeof value === 'object') {
-      try {
-        return JSON.stringify(value, null, indent);
-      } catch (error) {
-        // Fallback for circular references or other JSON errors
-        return String(value);
-      }
-    }
-    return String(value);
-  }
+  const childProcesses = new Set<string>();
+  processMap.forEach(process => {
+    const parent = parentProcess(process, nodesByPid);
+    if (!parent) return;
+    parent.children.push(process);
+    childProcesses.add(process.id);
+  });
 
-  // Get prompt data from various nested structures
-  getPromptData(): any {
-    const candidates = [
-      this.parseJson(this.get('body')),
-      this.parseJson(this.get('data.data')),
-      this.get('data'),
-      this.data
-    ];
+  processMap.forEach(process => {
+    process.events.sort((a, b) => a.timestamp_ms - b.timestamp_ms);
+    process.children.sort((a, b) => firstTimestamp(a) - firstTimestamp(b));
+    process.timeline = timelineForProcess(process);
+  });
 
-    for (const candidate of candidates) {
-      if (candidate && (candidate.model || candidate.messages || candidate.prompt)) {
-        return candidate;
-      }
-    }
-    return this.data;
-  }
-
-  // Get raw data for debugging/full visibility
-  getRawData(): string {
-    return this.toString(this.data, 2);
-  }
-
-  // Check if data seems to be AI-related but couldn't be parsed properly
-  isUnparsedAiData(): boolean {
-    const raw = this.toString(this.data).toLowerCase();
-    return raw.includes('model') || raw.includes('messages') || raw.includes('prompt') || 
-           raw.includes('temperature') || raw.includes('max_tokens') || raw.includes('anthropic') ||
-           raw.includes('openai') || raw.includes('claude');
-  }
+  return Array.from(processMap.values())
+    .filter(process => !childProcesses.has(process.id))
+    .sort((a, b) => firstTimestamp(a) - firstTimestamp(b));
 }
 
-// Parse different types of events
-export function parseEventData(event: Event): ParsedEvent | null {
-  const eventType = determineEventType(event.source, event.data);
-
-  switch (eventType) {
-    case 'prompt':
-      return parsePromptEvent(event);
-    case 'response':
-      return parseResponseEvent(event);
-    case 'ssl':
-      return parseSSLEvent(event);
-    case 'file':
-      return parseFileEvent(event);
-    case 'process':
-      return parseProcessEvent(event);
-    case 'stdio':
-      return parseStdioEvent(event);
-    default:
-      return parseGenericEvent(event);
-  }
+export function timelineForProcess(process: ProcessNode): TimelineItem[] {
+  return [
+    ...process.events.map(event => ({ type: 'event' as const, timestamp: event.timestamp_ms, event })),
+    ...process.children.map(child => ({ type: 'process' as const, timestamp: firstTimestamp(child), process: child })),
+  ].sort((a, b) => a.timestamp - b.timestamp);
 }
 
-function determineEventType(source: string, data: any): ParsedEvent['type'] {
-  // Check for system events first
-  const sourceStr = String(source || '').toLowerCase().trim();
-  const dataType = String(data?.type || '').toLowerCase().trim();
-  if (sourceStr === 'system' || dataType === 'system_metrics' || dataType === 'system_wide' || dataType.includes('system')) {
-    return 'system';
-  }
-
-  if (isStdioEvent(source, data)) return 'stdio';
-  if (isPromptEvent(source, data)) return 'prompt';
-  if (isResponseEvent(source, data)) return 'response';
-  if (isFileEvent(source, data)) return 'file';
-  if (isProcessEvent(source, data)) return 'process';
-  if (source.toLowerCase().includes('ssl') || source === 'http_parser') return 'ssl';
+export function treeEventType(row: SnapshotAuditEvent): TreeEventType {
+  if (row.audit_type === 'llm') return row.action === 'request' ? 'prompt' : 'response';
+  if (row.audit_type === 'file') return 'file';
+  if (row.audit_type === 'process') return 'process';
+  if (row.audit_type === 'stdio') return 'stdio';
+  if (row.audit_type === 'system') return 'system';
   return 'ssl';
 }
 
-function isStdioEvent(source: string, _data: any): boolean {
-  return isStdioSource(source);
+export function eventDetails(row: SnapshotAuditEvent): Record<string, any> {
+  return isRecord(row.details) ? row.details : {};
 }
 
-function isPromptEvent(source: string, data: any): boolean {
-  // Simple heuristics for AI request detection
-  const hasAIRequestIndicators = 
-    data.model || 
-    data.messages || 
-    data.prompt || 
-    data.inputs ||
-    data.query ||
-    (data.method === 'POST' && data.message_type === 'request' && 
-     (data.path?.includes('/v1/') || data.path?.includes('/api/')));
-    
-  return !!hasAIRequestIndicators;
+export function eventModel(row: SnapshotAuditEvent): string | undefined {
+  return row.subject ?? stringValue(eventDetails(row).model);
 }
 
-function isResponseEvent(source: string, data: any): boolean {
-  // Simple heuristics for AI response detection
-  const hasAIResponseIndicators = 
-    data.choices ||
-    data.completion ||
-    data.response ||
-    data.sse_events ||
-    data.delta ||
-    data.content_block ||
-    (source === 'sse_processor' && data.sse_events) ||
-    (data.message_type === 'response' && (data.model || data.usage));
-    
-  return !!hasAIResponseIndicators;
+export function eventTarget(row: SnapshotAuditEvent): string | undefined {
+  const details = eventDetails(row);
+  return row.target ?? stringValue(details.path) ?? stringValue(details.filepath);
 }
 
-function isFileEvent(source: string, data: any): boolean {
-  const extractor = new DataExtractor(data);
-  return source === 'file' || 
-         extractor.get('fd') !== undefined ||
-         (extractor.get('operation') && ['open', 'read', 'write', 'close'].includes(extractor.get('operation'))) ||
-         (extractor.get('event', '').includes('FILE_')) ||
-         extractor.get('filepath') !== undefined;
+export function eventSearchText(row: SnapshotAuditEvent): string {
+  return [
+    row.id,
+    row.audit_type,
+    row.action,
+    row.status,
+    row.summary,
+    row.comm,
+    eventModel(row),
+    eventTarget(row),
+    JSON.stringify(row.details ?? row),
+  ].filter(Boolean).join(' ').toLowerCase();
 }
 
-function isProcessEvent(source: string, data: any): boolean {
-  const extractor = new DataExtractor(data);
-  return (source === 'process' && !extractor.get('event', '').includes('FILE_')) || 
-         extractor.get('exec') !== undefined ||
-         extractor.get('exit') !== undefined ||
-         extractor.get('event') === 'EXEC' ||
-         extractor.get('event') === 'EXIT' ||
-         (extractor.get('ppid') !== undefined && !extractor.get('event', '').includes('FILE_'));
+export function eventName(row: SnapshotAuditEvent): string {
+  return auditEventName(row);
 }
 
-function parsePromptEvent(event: Event): ParsedEvent {
-  const data = event.data;
-  let model = data.model || 'AI Request';
-  const method = data.method || 'POST';
-  
-  // For http_parser events, parse the body field if it exists
-  let displayData = data;
-  if (data.body && typeof data.body === 'string') {
-    try {
-      const parsedBody = JSON.parse(data.body);
-      // Extract model from parsed body if available
-      if (parsedBody.model) {
-        model = parsedBody.model;
-      }
-      // Use parsed body as display data
-      displayData = { ...data, body: parsedBody };
-    } catch (e) {
-      // Keep original data if parsing fails
-    }
-  }
-  
-  // Simply show the JSON data as-is
-  const content = JSON.stringify(displayData, null, 2);
-  
-  const parsedEvent: ParsedEvent = {
-    id: event.id,
-    timestamp: event.timestamp,
-    type: 'prompt',
-    title: `${method} ${model}`,
-    content: content,
-    metadata: { model, method, url: `${data.host || ''}${data.path || ''}`, raw: data, original_source: event.source },
-    isExpanded: false
-  };
-  
-  // Get prompt history for this process
-  const pid = event.pid;
-  if (!promptHistoryByPid.has(pid)) {
-    promptHistoryByPid.set(pid, []);
-  }
-  
-  const history = promptHistoryByPid.get(pid)!;
-  
-  // If there's a previous prompt, generate diff
-  if (history.length > 0) {
-    const previousPrompt = history[history.length - 1];
-    const diffResult = comparePrompts(previousPrompt.metadata.raw, data);
-    
-    parsedEvent.promptDiff = {
-      ...diffResult,
-      previousPromptId: previousPrompt.id
-    };
-  }
-  
-  // Add this prompt to history
-  history.push(parsedEvent);
-  
-  // Keep only last 10 prompts per process to avoid memory issues
-  if (history.length > 10) {
-    history.shift();
-  }
-  
-  return parsedEvent;
+export function eventRaw(row: SnapshotAuditEvent): unknown {
+  return row.details ?? row;
 }
 
-function parseResponseEvent(event: Event): ParsedEvent {
-  const data = event.data;
-  let model = data.model || 'AI Response';
-  
-  // For sse_processor events, extract model and enhance display
-  let displayData = data;
-  if (data.sse_events && Array.isArray(data.sse_events)) {
-    // Look for model in SSE events
-    for (const sseEvent of data.sse_events) {
-      if (sseEvent.parsed_data?.message?.model) {
-        model = sseEvent.parsed_data.message.model;
-        break;
-      }
-    }
-  }
-  
-  // Simply show the JSON data as-is
-  const content = JSON.stringify(displayData, null, 2);
-  
+function processFromRow(row: SnapshotProcessNode): ProcessNode {
   return {
-    id: event.id,
-    timestamp: event.timestamp,
-    type: 'response',
-    title: model,
-    content: content,
-    metadata: { model, raw: data, original_source: event.source },
-    isExpanded: false
+    id: row.id,
+    pid: row.pid,
+    comm: row.comm ?? row.command ?? 'unknown',
+    ppid: row.ppid ?? undefined,
+    startTimestamp: row.start_timestamp_ms ?? undefined,
+    endTimestamp: row.end_timestamp_ms ?? undefined,
+    children: [],
+    events: [],
+    timeline: [],
   };
 }
 
-function parseSSLEvent(event: Event): ParsedEvent {
-  const data = event.data;
-  
-  const method = data.method || 'UNKNOWN';
-  const host = data.host || data.headers?.host || 'unknown';
-  const path = data.path || '/';
-  const statusCode = data.status_code;
-  
-  let title = `${method} ${host}${path}`;
-  if (statusCode) title += ` (${statusCode})`;
-  
-  // Simply show the JSON data as-is
-  const content = JSON.stringify(data, null, 2);
-
-  return {
-    id: event.id,
-    timestamp: event.timestamp,
-    type: 'ssl',
-    title,
-    content: content,
-    metadata: { ...data, original_source: event.source },
-    isExpanded: false
-  };
+function processForAudit(
+  row: SnapshotAuditEvent,
+  nodesByPid: Map<number, ProcessNode[]>,
+): ProcessNode | undefined {
+  if (typeof row.pid !== 'number') return undefined;
+  return lastMatching(
+    nodesByPid.get(row.pid),
+    process => containsTimestamp(process, row.timestamp_ms),
+  );
 }
 
-function parseFileEvent(event: Event): ParsedEvent {
-  const data = event.data;
-  const operation = data.operation || data.event || 'file op';
-  const path = data.path || data.filepath || 'unknown';
-  
-  // Simply show the JSON data as-is
-  const content = JSON.stringify(data, null, 2);
-
-  return {
-    id: event.id,
-    timestamp: event.timestamp,
-    type: 'file',
-    title: `${operation} ${path}`,
-    content: content,
-    metadata: { ...data, original_source: event.source },
-    isExpanded: false
-  };
+function parentProcess(
+  process: ProcessNode,
+  nodesByPid: Map<number, ProcessNode[]>,
+): ProcessNode | undefined {
+  if (!process.ppid) return undefined;
+  const start = firstTimestamp(process);
+  return lastMatching(
+    nodesByPid.get(process.ppid),
+    parent => parent.id !== process.id && containsTimestamp(parent, start),
+  );
 }
 
-function parseProcessEvent(event: Event): ParsedEvent {
-  const data = event.data;
-  const eventType = data.event || 'process';
-  const filename = data.filename;
-  const title = filename ? `${eventType}: ${filename}` : `${eventType} event`;
-  
-  // Simply show the JSON data as-is
-  const content = JSON.stringify(data, null, 2);
-
-  return {
-    id: event.id,
-    timestamp: event.timestamp,
-    type: 'process',
-    title,
-    content: content,
-    metadata: { ...data, original_source: event.source },
-    isExpanded: false
-  };
+function containsTimestamp(process: ProcessNode, timestamp: number): boolean {
+  return (process.startTimestamp ?? 0) <= timestamp
+    && (process.endTimestamp === undefined || timestamp <= process.endTimestamp);
 }
 
-function parseStdioEvent(event: Event): ParsedEvent {
-  const decoded = decodeStdioMessage(event.data);
-
-  return {
-    id: event.id,
-    timestamp: event.timestamp,
-    type: 'stdio',
-    title: decoded.title,
-    content: formatStdioExpandedContent(decoded),
-    metadata: {
-      ...event.data,
-      original_source: event.source,
-      stdio_kind: decoded.kind,
-      rpc_method: decoded.method,
-      rpc_id: decoded.id,
-      tool_name: decoded.toolName,
-      summary: decoded.summary,
-      parsed_payload: decoded.parsedPayload,
-    },
-    isExpanded: false
-  };
-}
-
-function parseGenericEvent(event: Event): ParsedEvent {
-  // Simply show the JSON data as-is
-  const content = JSON.stringify(event.data, null, 2);
-  
-  return {
-    id: event.id,
-    timestamp: event.timestamp,
-    type: 'ssl',
-    title: `${event.source} event`,
-    content: content,
-    metadata: { ...event.data, original_source: event.source },
-    isExpanded: false
-  };
-}
-
-// Helper function to get the earliest timestamp for a process
-function getEarliestTimestamp(process: ProcessNode): number {
-  let earliest = Infinity;
-  
-  // Check process events
-  if (process.events.length > 0) {
-    earliest = Math.min(earliest, process.events[0].timestamp);
+function lastMatching<T>(items: T[] | undefined, predicate: (item: T) => boolean): T | undefined {
+  if (!items) return undefined;
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (predicate(items[i])) return items[i];
   }
-  
-  // Check child processes recursively
-  process.children.forEach(child => {
-    earliest = Math.min(earliest, getEarliestTimestamp(child));
-  });
-  
+  return undefined;
+}
+
+function firstTimestamp(process: ProcessNode): number {
+  const childStart = process.children.reduce(
+    (earliest, child) => Math.min(earliest, firstTimestamp(child)),
+    Infinity,
+  );
+  const eventStart = process.events[0]?.timestamp_ms ?? Infinity;
+  const ownStart = process.startTimestamp ?? Infinity;
+  const earliest = Math.min(ownStart, eventStart, childStart);
   return earliest === Infinity ? 0 : earliest;
 }
 
-// Build process hierarchy from events
-export function buildProcessTree(events: Event[]): ProcessNode[] {
-  const processMap = new Map<number, ProcessNode>();
-  const eventsByPid = new Map<number, ParsedEvent[]>();
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
 
-  // First pass: create process nodes and parse events
-  events.forEach(event => {
-    // Skip system metrics events - they should not appear in process tree
-    const source = String(event.source || '').toLowerCase().trim();
-    const dataType = String(event.data?.type || '').toLowerCase().trim();
-
-    if (source === 'system' ||
-        dataType === 'system_metrics' ||
-        dataType === 'system_wide' ||
-        dataType.includes('system')) {
-      return;
-    }
-
-    const { pid, comm } = event;
-    
-    // Initialize process if not exists
-    if (!processMap.has(pid)) {
-      processMap.set(pid, {
-        pid,
-        comm: comm || 'unknown',
-        children: [],
-        events: [],
-        timeline: [],
-        isExpanded: false
-      });
-    }
-    
-    // Parse event and group by PID
-    const parsedEvent = parseEventData(event);
-    if (parsedEvent === null) {
-      return; // Skip system events
-    }
-    if (!eventsByPid.has(pid)) {
-      eventsByPid.set(pid, []);
-    }
-    eventsByPid.get(pid)!.push(parsedEvent);
-    
-    // Extract parent PID if available
-    if (event.source === 'process' && event.data.ppid) {
-      const process = processMap.get(pid)!;
-      process.ppid = event.data.ppid;
-    }
-  });
-  
-  // Assign events to processes
-  eventsByPid.forEach((events, pid) => {
-    const process = processMap.get(pid);
-    if (process) {
-      process.events = events.sort((a, b) => a.timestamp - b.timestamp);
-    }
-  });
-  
-  // Build tree structure
-  const rootProcesses: ProcessNode[] = [];
-  const childProcesses = new Set<number>();
-  
-  processMap.forEach((process, pid) => {
-    if (process.ppid && processMap.has(process.ppid)) {
-      const parent = processMap.get(process.ppid)!;
-      parent.children.push(process);
-      childProcesses.add(pid);
-    }
-  });
-  
-  // Build timeline for each process (mix events and child processes chronologically)
-  processMap.forEach(process => {
-    const timelineItems: TimelineItem[] = [];
-    
-    // Add all events as timeline items
-    process.events.forEach(event => {
-      timelineItems.push({
-        type: 'event',
-        timestamp: event.timestamp,
-        event
-      });
-    });
-    
-    // Add child processes as timeline items (using their earliest timestamp)
-    process.children.forEach(child => {
-      timelineItems.push({
-        type: 'process',
-        timestamp: getEarliestTimestamp(child),
-        process: child
-      });
-    });
-    
-    // Sort timeline by timestamp
-    process.timeline = timelineItems.sort((a, b) => a.timestamp - b.timestamp);
-  });
-  
-  // Root processes are those without parents
-  processMap.forEach((process, pid) => {
-    if (!childProcesses.has(pid)) {
-      rootProcesses.push(process);
-    }
-  });
-  
-  // Sort root processes by their earliest timestamp
-  return rootProcesses.sort((a, b) => getEarliestTimestamp(a) - getEarliestTimestamp(b));
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

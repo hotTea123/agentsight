@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
-#ifndef __PROCESS_NEW_BPF_NET_H
-#define __PROCESS_NEW_BPF_NET_H
+#ifndef __PROCESS_EXT_BPF_NET_H
+#define __PROCESS_EXT_BPF_NET_H
 
 /*
  * Network tracepoints: bind, listen, connect.
@@ -119,4 +119,4 @@ int trace_connect(struct trace_event_raw_sys_enter *ctx)
 	return 0;
 }
 
-#endif /* __PROCESS_NEW_BPF_NET_H */
+#endif /* __PROCESS_EXT_BPF_NET_H */

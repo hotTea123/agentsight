@@ -3,15 +3,14 @@
 
 'use client';
 
-import { ProcessedEvent } from '@/types/event';
-import { formatEventSummary } from '@/utils/eventProcessing';
+import { DisplayEvent, formatDisplayEventSummary } from '@/utils/eventProcessing';
 
 interface TimelineGroupProps {
   source: string;
-  events: ProcessedEvent[];
+  events: DisplayEvent[];
   color: string;
   getEventPosition: (timestamp: number) => number;
-  onEventClick: (event: ProcessedEvent) => void;
+  onEventClick: (event: DisplayEvent) => void;
 }
 
 export function TimelineGroup({
@@ -60,7 +59,7 @@ export function TimelineGroup({
               {/* Tooltip */}
               <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity z-10">
                 <div className="bg-black text-white text-xs rounded px-2 py-1 whitespace-nowrap">
-                  {formatEventSummary(event)}
+                  {formatDisplayEventSummary(event)}
                   <div className="text-gray-300">
                     {event.formattedTime}
                   </div>

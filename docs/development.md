@@ -1,6 +1,6 @@
 # Development Guide
 
-**English** | [中文](development.zh-CN.md)
+**English** | [中文](https://github.com/eunomia-bpf/agentsight/blob/master/docs/development.zh-CN.md)
 
 ## Frontend Dev Mode (Disk-First Assets)
 

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
-#ifndef __PROCESS_NEW_BPF_SIGNALS_H
-#define __PROCESS_NEW_BPF_SIGNALS_H
+#ifndef __PROCESS_EXT_BPF_SIGNALS_H
+#define __PROCESS_EXT_BPF_SIGNALS_H
 
 /*
  * Process coordination tracepoints: setpgid, setsid, kill, fork.
@@ -135,4 +135,4 @@ int trace_fork(struct trace_event_raw_sched_process_fork *ctx)
 	return 0;
 }
 
-#endif /* __PROCESS_NEW_BPF_SIGNALS_H */
+#endif /* __PROCESS_EXT_BPF_SIGNALS_H */

@@ -5,12 +5,14 @@
 
 import { ChevronDownIcon, ChevronRightIcon } from '@heroicons/react/24/outline';
 import React from 'react';
+import { useTranslation } from '@/i18n';
+import type { TranslationKey } from '@/i18n';
 
 // Clean unified block interface
 
 export interface UnifiedBlockData {
   id: string;
-  type: 'prompt' | 'response' | 'ssl' | 'file' | 'process' | 'stdio';
+  type: 'prompt' | 'response' | 'ssl' | 'file' | 'process' | 'stdio' | 'system';
   timestamp: number;
   tags: string[];
   bgGradient: string;
@@ -30,6 +32,15 @@ interface UnifiedBlockProps {
 // Simplified unified block - no complex field rendering needed
 
 export function UnifiedBlock({ data, isExpanded, onToggle }: UnifiedBlockProps) {
+  const { t } = useTranslation();
+
+  const translateTag = (tag: string): string => {
+    if (tag.startsWith('tag.')) {
+      return t(tag as TranslationKey);
+    }
+    return tag;
+  };
+
   const formatTimestamp = (timestamp: number) => {
     return new Date(timestamp).toLocaleTimeString('en-US', {
       hour12: false,
@@ -39,12 +50,7 @@ export function UnifiedBlock({ data, isExpanded, onToggle }: UnifiedBlockProps) 
     });
   };
 
-  const shouldShowExpandButton = data.expandedContent.length > 300;
   const handleToggle = () => {
-    if (!shouldShowExpandButton) {
-      return;
-    }
-
     const selection = window.getSelection();
     if (selection && selection.toString().length > 0) {
       return;
@@ -87,14 +93,14 @@ export function UnifiedBlock({ data, isExpanded, onToggle }: UnifiedBlockProps) 
                     const textColor = data.iconColor.replace('-600', '-800').replace('-700', '-800');
                     return (
                       <span key={tag} className={`px-2 py-1 text-xs font-bold rounded uppercase ${bgColor} ${textColor}`}>
-                        {tag}
+                        {translateTag(tag)}
                       </span>
                     );
                   } else {
                     // Other tags use gray
                     return (
                       <span key={tag} className="px-2 py-1 bg-gray-100 text-gray-800 text-xs font-bold rounded uppercase">
-                        {tag}
+                        {translateTag(tag)}
                       </span>
                     );
                   }
@@ -112,15 +118,13 @@ export function UnifiedBlock({ data, isExpanded, onToggle }: UnifiedBlockProps) 
                 <span className="text-xs text-gray-500">
                   {formatTimestamp(data.timestamp)}
                 </span>
-                {shouldShowExpandButton && (
-                  <div className="flex-shrink-0">
-                    {isExpanded ? (
-                      <ChevronDownIcon className={`h-4 w-4 ${data.iconColor}`} />
-                    ) : (
-                      <ChevronRightIcon className={`h-4 w-4 ${data.iconColor}`} />
-                    )}
-                  </div>
-                )}
+                <div className="flex-shrink-0">
+                  {isExpanded ? (
+                    <ChevronDownIcon className={`h-4 w-4 ${data.iconColor}`} />
+                  ) : (
+                    <ChevronRightIcon className={`h-4 w-4 ${data.iconColor}`} />
+                  )}
+                </div>
               </div>
             </div>
           </div>

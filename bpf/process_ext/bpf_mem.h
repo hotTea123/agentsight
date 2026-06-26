@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
-#ifndef __PROCESS_NEW_BPF_MEM_H
-#define __PROCESS_NEW_BPF_MEM_H
+#ifndef __PROCESS_EXT_BPF_MEM_H
+#define __PROCESS_EXT_BPF_MEM_H
 
 /*
  * mmap tracepoint: only capture MAP_SHARED mappings.
@@ -31,4 +31,4 @@ int trace_mmap(struct trace_event_raw_sys_enter *ctx)
 	return 0;
 }
 
-#endif /* __PROCESS_NEW_BPF_MEM_H */
+#endif /* __PROCESS_EXT_BPF_MEM_H */

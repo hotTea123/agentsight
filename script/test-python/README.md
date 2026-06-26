@@ -482,7 +482,7 @@ let reassembler = StreamReassembler::new();
 SSLRunner::new()
     .add_analyzer(reassembler)
     .add_analyzer(HttpFilter::new())
-    .add_analyzer(OutputAnalyzer::new())
+    .add_analyzer(FileLogger::new("events.log")?)
     .run()
     .await?;
 ```

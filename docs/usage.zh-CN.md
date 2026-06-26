@@ -1,6 +1,6 @@
 # 使用说明
 
-[English](usage.md) | **中文**
+[English](https://github.com/eunomia-bpf/agentsight/blob/master/docs/usage.md) | **中文**
 
 ## 从源代码编译
 
@@ -42,43 +42,65 @@ make build-rust   # 仅编译 Rust collector
 make build-frontend  # 仅编译前端
 ```
 
-## 使用agentsight监测Claude Code的命令行参数
+## 从源码运行
 
-进入源代码的根目录，然后执行如下命令来测试：
-
-```sh
-sudo ./collector/target/release/agentsight ssl --http-parser --http-filter "request.path_prefix=/v1/rgstr | response.status_code=202 | request.method=HEAD | response.body=" --ssl-filter "data=0\r\n\r\n"
-```
+`make build` 完成后，在仓库根目录运行下面的命令。需要加载 eBPF probes
+的命令推荐显式使用 `sudo`；AgentSight 在你忘记 sudo 时可以自动请求提权，
+但那只是补救路径。
 
 ```sh
-sudo ./collector/target/release/agentsight agent -c "claude" --http-parser --http-filter "request.path_prefix=/v1/rgstr | response.status_code=202 | request.method=HEAD | response.body=" --ssl-filter "data=0\r\n\r\n"
+# 实时查看本机智能体 session
+sudo ./collector/target/release/agentsight top
+
+# 启动并记录一个命令
+sudo ./collector/target/release/agentsight record -- claude
+
+# 查看最近保存的运行
+./collector/target/release/agentsight report
+
+# 附加到已经运行的进程族
+sudo ./collector/target/release/agentsight record -c claude
+
+# 可配置的底层调试追踪
+sudo ./collector/target/release/agentsight debug trace --server -c claude
+
+# 原始 SSL 调试捕获，启用 HTTP 解析
+sudo ./collector/target/release/agentsight debug ssl --http-parser
 ```
 
-```sh
-sudo ./collector/target/release/agentsight agent -c claude --http-filter "request.path_prefix=/v1/rgstr | response.status_code=202 | request.method=HEAD | response.body=" --ssl-filter "data=0\r\n\r\n|data.type=binary"
-```
+## top、record 与 debug trace
 
-## record 与 trace 子命令对比
+日常使用先从 `top` 开始；需要保存一次运行用于复盘时使用 `record`；只有在需要
+精细控制采集源和过滤规则时才使用 `debug trace`。
 
-agentsight 提供 `record` 和 `trace` 两个子命令，它们共用同一个底层执行逻辑，但面向不同的使用场景。
+### top — 默认实时视图
 
-### record — 开箱即用的智能体录制
-
-适用于快速录制 AI 智能体（Claude Code、Python AI 工具等）的行为，无需关心细节配置。
-
-- `-c/--comm` 是**必填**参数，如 `-c claude`
-- **自动开启**：SSL 监控 + 进程监控 + 系统监控 + Web 服务器（端口 7395）
-- **内置过滤规则**：自动过滤掉注册请求（`/v1/rgstr`）、HEAD 请求、空响应体、202 状态码、二进制数据等噪音
-- 默认**静默模式**（不输出到控制台），数据写入 `record.log`
-- 默认开启**日志轮转**
+`top` 是最直接的入口，用于实时查看本机正在活动的智能体 session。它会发现本地
+智能体进程和 agent-native session 日志，并把系统活动关联到 session。
 
 典型用法：
 
 ```sh
-sudo ./agentsight record -c claude --binary-path <path>
+sudo ./agentsight top
 ```
 
-### trace — 完全可控的灵活监控
+### record — 开箱即用的智能体录制
+
+适用于录制 AI 智能体（Claude Code、Python AI 工具等）的一次运行，生成可复盘的本地 session。
+
+- `record -- <command>` 用于启动并记录一个命令；`record -c/-p` 用于附加到已运行进程
+- **自动开启**：SSL 监控 + 进程监控 + 系统监控 + Web 服务器（端口 7395）
+- **内置过滤规则**：自动过滤掉注册请求（`/v1/rgstr`）、HEAD 请求、空响应体、202 状态码、二进制数据等噪音
+- 默认**静默模式**（不输出到底层事件流），数据写入实时 view 和本地 SQLite session
+
+典型用法：
+
+```sh
+sudo ./agentsight record -- claude
+./agentsight report
+```
+
+### debug trace — 完全可控的灵活监控
 
 适用于需要自定义监控范围、过滤规则的调试和分析场景。
 
@@ -91,19 +113,19 @@ sudo ./agentsight record -c claude --binary-path <path>
 典型用法：
 
 ```sh
-sudo ./agentsight trace --ssl true --process false --server true --http-filter "request.method=POST"
+sudo ./agentsight debug trace --ssl true --process false --server --http-filter "request.method=POST"
 ```
 
 ### 对比总结
 
-| 维度 | record | trace |
+| 维度 | record | debug trace |
 |------|--------|-------|
 | 定位 | 一键录制，预设优化 | 灵活定制，精细控制 |
-| 必填参数 | `-c <comm>` | 无 |
-| Web 服务器 | 始终开启 | 需 `--server true` |
-| 系统监控 | 始终开启 | 需 `--system true` |
+| 必填参数 | 无；可用 `-- <command>`、`-c <comm>` 或 `-p <pid>` | 无 |
+| Web 服务器 | 默认开启，可用 `--no-server` 关闭 | 需 `--server` |
+| 系统监控 | 默认开启 | 需 `--system` |
 | 控制台输出 | 默认关闭 | 默认开启 |
 | 过滤规则 | 内置预设 | 用户自定义 |
-| 日志轮转 | 默认开启 | 需 `--rotate-logs` |
+| 持久化 | 默认 SQLite | 传 `--db` 时写 SQLite |
 
-简单来说：**日常录制用 `record`，深度调试用 `trace`**。
+简单来说：**实时查看用 `top`，保存复盘用 `record`，深度调试用 `debug trace`**。

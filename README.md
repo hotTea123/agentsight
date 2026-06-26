@@ -1,340 +1,215 @@
-# AgentSight: Zero-Instrumentation LLM Agent Observability with eBPF
+# AgentSight: System-wide AI agent profiling and monitoring with eBPF
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/eunomia-bpf/agentsight)
+[![CI](https://github.com/eunomia-bpf/agentsight/actions/workflows/ci.yml/badge.svg)](https://github.com/eunomia-bpf/agentsight/actions/workflows/ci.yml)
+[![arXiv:2508.02736](https://img.shields.io/badge/arXiv-2508.02736-b31b1b.svg)](https://arxiv.org/abs/2508.02736)
+[![DOI:10.1145/3766882.3767169](https://img.shields.io/badge/DOI-10.1145%2F3766882.3767169-blue.svg)](https://dl.acm.org/doi/10.1145/3766882.3767169)
 
-**English** | [中文](README.zh-CN.md)
+**English** | [中文](https://github.com/eunomia-bpf/agentsight/blob/master/README.zh-CN.md)
 
-AgentSight is a observability tool designed specifically for monitoring LLM agent behavior through SSL/TLS traffic interception and process monitoring. Unlike traditional application-level instrumentation, AgentSight observes at the system boundary using eBPF technology, providing comprehensive insights into AI agent interactions with minimal performance overhead.
+Your local first `perf`/`top`/`strace`/`nsight`-like tool for AI agents. See what agents actually do
+to your machine, and connect those actions back to the prompts, model calls, and
+tool decisions that triggered them.
 
-**✨ Zero Instrumentation Required** - No code changes, no new dependencies, no SDKs. Works with any AI framework or application out of the box.
+Run `agentsight` around Claude Code, Codex, Gemini CLI,
+OpenCode, OpenClaw, or any command. AgentSight records:
+
+- processes and child processes, shell commands, cwd, argv, exit status, and duration
+- files created, written, truncated, renamed, or deleted
+- network destinations contacted
+- prompts, responses, tool intent, and LLM/model/token
+
+No SDK, no proxy, no vendor integration. AgentSight observes with eBPF and TLS traffic tracing, so it works even when the agent is a
+closed-source CLI. **✨ Zero SDK Required**
 
 ## Quick Start
 
 ```bash
-wget https://github.com/eunomia-bpf/agentsight/releases/latest/download/agentsight && chmod +x agentsight
-# Record Claude Code activity (Bun-based, requires --binary-path for statically-linked BoringSSL)
-sudo ./agentsight record -c claude --binary-path ~/.local/share/claude/versions/$(claude --version | head -1)
-# Record agent behavior from claude (old version)
-sudo ./agentsight record -c "claude"
-# Record agent behavior from gemini-cli (comm is "node")
-sudo ./agentsight record -c "node"
-# For Python AI tools (e.g. aider, open-interpreter)
-sudo ./agentsight record -c "python"
-# For Node.js apps with NVM (statically-linked OpenSSL)
-sudo ./agentsight record -c node --binary-path ~/.nvm/versions/node/v20.0.0/bin/node
+cargo install agentsight
+# or: wget https://github.com/eunomia-bpf/agentsight/releases/latest/download/agentsight && chmod +x agentsight
+sudo agentsight top
 ```
 
-Visit [http://127.0.0.1:7395](http://127.0.0.1:7395) to view the recorded data.
-
 <div align="center">
-  <img src="https://github.com/eunomia-bpf/agentsight/raw/master/docs/demo-tree.png" alt="AgentSight Demo - Process Tree Visualization" width="800">
-  <p><em>Real-time process tree visualization showing AI agent interactions and file operations</em></p>
-</div>
-
-<div align="center">
-  <img src="https://github.com/eunomia-bpf/agentsight/raw/master/docs/demo-timeline.png" alt="AgentSight Demo - Timeline Visualization" width="800">
-  <p><em>Real-time timeline visualization showing AI agent interactions and system calls</em></p>
-</div>
-
-<div align="center">
-  <img src="https://github.com/eunomia-bpf/agentsight/raw/master/docs/demo-metrics.png" alt="AgentSight Demo - Metrics Visualization" width="800">
-  <p><em>Real-time metrics visualization showing AI agent memory and CPU usage</em></p>
+  <img src="https://github.com/eunomia-bpf/agentsight/raw/master/docs/top-mode-demo.png" alt="AgentSight top live session view" width="1000">
+  <p><em>Live sessions ranked by model, session tokens, health, process family, tool calls, file activity, and network activity</em></p>
 </div>
 
 ## 🚀 Why AgentSight?
 
 ### Traditional Observability vs. System-Level Monitoring
 
+Application-level tools such as [LangSmith](https://docs.langchain.com/langsmith/observability-concepts), [Langfuse](https://langfuse.com/docs/observability/overview), and [Phoenix](https://arize.com/docs/phoenix/) are great for traces, prompts, tokens, evals, and latency when you own the application code. Gateway/proxy tools such as [Helicone](https://docs.helicone.ai/getting-started/integration-method/gateway) are useful when you can route provider traffic through a managed endpoint.
+
+AgentSight focuses on the layer those tools often miss: what the agent actually does at the system boundary. It observes existing binaries and CLI agents without SDKs or proxies, then correlates LLM traffic with process execution, file access, and system activity.
+
 | **Challenge** | **Application-Level Tools** | **AgentSight Solution** |
 |---------------|----------------------------|------------------------|
-| **Framework Adoption** | ❌ New SDK/proxy for each framework | ✅ Drop-in daemon, no code changes |
-| **Closed-Source Tools** | ❌ Limited visibility into operations | ✅ Complete visibility into prompts & behaviors |
-| **Dynamic Agent Behavior** | ❌ Logs can be silenced or manipulated | ✅ Kernel-level hooks for reliable monitoring |
-| **Encrypted Traffic** | ❌ Only sees wrapper outputs | ✅ Captures real unencrypted requests/responses |
-| **System Interactions** | ❌ Misses subprocess executions | ✅ Tracks all process behaviors & file operations |
-| **Multi-Agent Systems** | ❌ Isolated per-process tracing | ✅ Global correlation and analysis |
+| **Framework Adoption** | ❌ SDK, callback, or gateway integration per app | ✅ Drop-in system tracer, no code changes |
+| **Closed-Source CLIs** | ❌ Limited to what the tool exposes or logs | ✅ Observes existing binaries and CLI agents from outside |
+| **Agent-Controlled Logs** | ❌ Logs can be incomplete, disabled, or modified | ✅ Kernel-level events independent of app logging |
+| **TLS LLM Traffic** | ❌ Visible when routed through SDKs/proxies | ✅ Captures plaintext at SSL/TLS calls without a proxy |
+| **System Actions** | ❌ Often misses subprocesses and local file activity | ✅ Tracks process execution, file access, and resource use |
+| **Cross-Boundary Behavior** | ❌ Traces usually stop at framework/process boundaries | ✅ Correlates LLM traffic with process and file events |
 
 AgentSight captures critical interactions that application-level tools miss:
 
 - Subprocess executions that bypass instrumentation
-- Raw encrypted payloads before agent processing
+- Plaintext LLM payloads at SSL/TLS call boundaries
 - File operations and system resource access  
-- Cross-agent communications and coordination
-
-## 🏗️ Architecture
-
-```ascii
-┌─────────────────────────────────────────────────┐
-│              AI Agent Runtime                   │
-│   ┌─────────────────────────────────────────┐   │
-│   │    Application-Level Observability      │   │
-│   │  (LangSmith, Helicone, Langfuse, etc.)  │   │
-│   │         🔴 Can be bypassed               │   │
-│   └─────────────────────────────────────────┘   │
-│                     ↕ (Can be bypassed)         │
-├─────────────────────────────────────────────────┤ ← System Boundary
-│  🟢 AgentSight eBPF Monitoring (Kernel-level)   │
-│  ┌─────────────────┐  ┌─────────────────────┐   │
-│  │   SSL Traffic   │  │    Process Events   │   │
-│  │   Monitoring    │  │    Monitoring       │   │
-│  └─────────────────┘  └─────────────────────┘   │
-└─────────────────────────────────────────────────┘
-                      ↓
-┌─────────────────────────────────────────────────┐
-│         Rust Streaming Analysis Framework       │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────┐  │
-│  │   Runners   │  │  Analyzers   │  │ Output │  │
-│  │ (Collectors)│  │ (Processors) │  │        │  │
-│  └─────────────┘  └──────────────┘  └────────┘  │
-└─────────────────────────────────────────────────┘
-                      ↓
-┌─────────────────────────────────────────────────┐
-│           Frontend Visualization                │
-│     Timeline • Process Tree • Event Logs       │
-└─────────────────────────────────────────────────┘
-```
-
-### Core Components
-
-1. **eBPF Data Collection** (Kernel Space)
-   - **SSL Monitor**: Intercepts SSL/TLS read/write operations via uprobe hooks
-   - **Process Monitor**: Tracks process lifecycle and file operations via tracepoints
-   - **<3% Performance Overhead**: Operates below application layer with minimal impact
-
-2. **Rust Streaming Framework** (User Space)
-   - **Runners**: Execute eBPF programs and stream JSON events (SSL, Process, Agent, Combined)
-   - **Analyzers**: Pluggable processors for HTTP parsing, chunk merging, filtering, logging
-   - **Event System**: Standardized event format with rich metadata and JSON payloads
-
-3. **Frontend Visualization** (React/TypeScript)
-   - Interactive timeline, process tree, and log views
-   - Real-time data streaming and analysis
-   - See "Web Interface Access" section for details
-
-### Data Flow Pipeline
-
-```
-eBPF Programs → JSON Events → Runners → Analyzer Chain → Frontend/Storage/Output
-```
+- Cross-boundary behavior across LLM, process, and file events
 
 ## Usage
 
 ### Prerequisites
 
 - **Linux kernel**: 4.1+ with eBPF support (5.0+ recommended)
-- **Root privileges**: Required for eBPF program loading
-- **Rust toolchain**: 1.88.0+ (for building collector)
-- **Node.js**: 18+ (for frontend development)
-- **Build tools**: clang, llvm, libelf-dev
+- **sudo access**: eBPF probes are auto-elevated; your agent stays unprivileged
+
+For source builds, see [docs/build.md](https://github.com/eunomia-bpf/agentsight/blob/master/docs/build.md).
 
 ### Installation
 
-#### Option 1: Using Docker (Recommended)
+#### Cargo or Release Binary
 
-AgentSight runs in Docker with `--privileged` for eBPF, `--pid=host` to access host processes, `-v /sys:/sys:ro` for process monitoring, and `-v /usr:/usr:ro -v /lib:/lib:ro` for SSL library access (required to attach uprobes to shared libraries like `libssl.so`). Example:
+For local use, install with `cargo install agentsight` or download the latest
+release binary, then start with `sudo agentsight top`. Use the examples below when
+you want to record a specific command or inspect saved sessions.
 
-```bash
-# Monitor Python AI tools
-docker run --privileged --pid=host --network=host \
-  -v /sys:/sys:ro -v /usr:/usr:ro -v /lib:/lib:ro \
-  -v $(pwd)/logs:/logs \
-  ghcr.io/eunomia-bpf/agentsight:latest \
-  record --comm python --log-file /logs/record.log
+#### Docker
 
-# Monitor Claude Code (mount home dir for binary access)
-docker run --privileged --pid=host --network=host \
-  -v /sys:/sys:ro -v /usr:/usr:ro -v /lib:/lib:ro \
-  -v $HOME/.local/share/claude:/claude:ro \
-  -v $(pwd)/logs:/logs \
-  ghcr.io/eunomia-bpf/agentsight:latest \
-  record --comm claude --binary-path /claude/versions/2.1.39 --log-file /logs/record.log
-```
+Docker is useful for container, CI, or isolated Linux environments, but it still needs privileged host access for eBPF. See [docs/docker.md](https://github.com/eunomia-bpf/agentsight/blob/master/docs/docker.md).
 
-#### Option 2: Build from Source
+#### Build from Source
+
+Build requirements and source build commands live in [docs/build.md](https://github.com/eunomia-bpf/agentsight/blob/master/docs/build.md).
+
+### Querying Past Sessions
+
+Every `record` session is automatically saved to an `agentsight-*.db` SQLite
+file in the current directory. Start with the live and record commands, then
+use `agentsight report` for structured queries:
 
 ```bash
-# Clone repository with submodules
-git clone https://github.com/eunomia-bpf/agentsight.git --recursive
-cd agentsight
-
-# Install system dependencies (Ubuntu/Debian)
-make install
-
-# Build all components (frontend, eBPF, and Rust)
-make build
-
-# Or build individually:
-# make build-frontend  # Build frontend assets
-# make build-bpf       # Build eBPF programs
-# make build-rust      # Build Rust collector
-
+sudo agentsight top                          # live ranked view of current agent sessions
+agentsight monitor install-service           # install/start the background monitor service
+agentsight top --db run.db --once            # ranked view of a saved session
+sudo agentsight record -- claude             # record a command
+agentsight report                            # high-level run summary (default)
+agentsight report list                       # recorded sessions in this directory
+agentsight report prompts --json             # full LLM request/response JSON
+agentsight report token                      # token usage from latest session in this directory
+agentsight report audit --json               # process spawns, file opens, API calls
+agentsight report serve                      # open the web UI for the latest session in this directory
+agentsight report export -o snapshot.json    # export for web dashboard
+agentsight report --local                    # summarize native Claude/Codex/Gemini sessions
 ```
 
-### Usage Examples
+### Offline Agent pprof Profiles
 
-#### Monitoring Claude Code
-
-Claude Code is a Bun-based application with BoringSSL statically linked and
-symbols stripped. AgentSight auto-detects BoringSSL functions via byte-pattern
-matching when `--binary-path` is provided:
+Use `agentpprof` when you want a no-sudo pprof/folded-stack/SVG summary of
+local Codex or Claude session history:
 
 ```bash
-# Find the Claude binary version
-CLAUDE_BIN=~/.local/share/claude/versions/$(claude --version | head -1)
+cargo run --manifest-path agentpprof/Cargo.toml -- \
+  --project-root . \
+  --view tokens \
+  -o agent.pb.gz
 
-# Record all Claude activity with web UI
-sudo ./agentsight record -c claude --binary-path "$CLAUDE_BIN"
-# Open http://127.0.0.1:7395 to view timeline
-
-# Advanced: full trace with custom filters
-sudo ./agentsight trace --ssl true --process true --comm claude \
-  --binary-path "$CLAUDE_BIN" --server true --server-port 8080
+go tool pprof -top agent.pb.gz
 ```
 
-This captures:
-- **Conversation API**: `POST /v1/messages` requests with full prompt/response SSE streaming
-- **Telemetry**: heartbeat, event logging, Datadog logs
-- **Process activity**: file operations, subprocess executions
+The `tokens` view is the best first flamegraph for cost analysis: it aggregates
+real local Codex/Claude development sessions by project, agent, session tag,
+prompt tag, model, and token kind.
 
-> **Note**: All SSL traffic in Claude flows through an internal "HTTP Client"
-> thread, not the main "claude" thread. When `--binary-path` is specified,
-> the `--comm` filter is automatically skipped for SSL monitoring (but still
-> applied for process monitoring) to ensure traffic is captured correctly.
+<div align="center">
+  <img src="https://github.com/eunomia-bpf/agentsight/raw/master/docs/flamegraph-example/bpf-benchmark-tokens.svg" alt="agentpprof token flamegraph from real bpf-benchmark development sessions" width="1000">
+  <p><em>Offline token profile generated from real local bpf-benchmark coding-agent sessions</em></p>
+</div>
 
-#### Monitoring Python AI Tools
+See [agentpprof/README.md](agentpprof/README.md) for CLI details and
+[docs/flamegraph](docs/flamegraph-example/README.md) for flamegraph examples, view
+selection, and deterministic tagging rules.
 
-```bash
-# Monitor aider, open-interpreter, or any Python-based AI tool
-sudo ./agentsight record -c "python"
+### Web Interface
 
-# Custom port and log file
-sudo ./agentsight record -c "python" --server-port 8080 --log-file /tmp/agent.log
-```
-
-#### Monitoring Node.js AI Tools (Gemini CLI, etc.)
-
-For Node.js applications installed via NVM that statically link OpenSSL, use
-`--binary-path` to point to the actual Node.js binary:
-
-```bash
-# Monitor Gemini CLI or other Node.js AI tools
-sudo ./agentsight record -c node --binary-path ~/.nvm/versions/node/v20.0.0/bin/node
-
-# Or with system Node.js (uses dynamic libssl, no --binary-path needed)
-sudo ./agentsight record -c node
-```
-
-#### Advanced Monitoring
-
-```bash
-# Combined SSL and process monitoring with web interface
-sudo ./agentsight trace --ssl true --process true --server true
-
-# Custom port and log file
-sudo ./agentsight record -c "python" --server-port 8080 --log-file /tmp/agent.log
-```
-
-#### Browser Plaintext Capture
-
-For browser-specific plaintext capture, use the standalone `browsertrace` BPF
-tool instead of `sslsniff`:
-
-```bash
-# Chrome / Chromium
-sudo ./bpf/browsertrace --binary-path /opt/google/chrome/chrome
-
-# Firefox on Ubuntu Snap
-sudo ./bpf/browsertrace --binary-path /snap/firefox/current/usr/lib/firefox/firefox
-```
-
-> **Note**: On Ubuntu, `/usr/bin/firefox` is often a wrapper script rather than
-> the real browser ELF. Point `browsertrace` at the actual Firefox binary.
-
-#### Local MCP over stdio
-
-For local MCP servers that communicate over `stdio` instead of HTTP/TLS, use
-the standalone `stdiocap` BPF tool:
-
-```bash
-# Capture stdin/stdout/stderr payloads for a local MCP server process
-sudo ./bpf/stdiocap -p <mcp_server_pid>
-```
-
-AgentSight also includes a minimal MCP fixture for local testing under
-[`docs/mcp-test/README.md`](docs/mcp-test/README.md). It provides both `stdio`
-and HTTP test modes so you can generate predictable MCP traffic before wiring
-it into the Rust collector.
-
-#### Direct eBPF Program Usage
-
-```bash
-# Run sslsniff directly on Claude binary
-sudo ./bpf/sslsniff --binary-path ~/.local/share/claude/versions/2.1.39
-
-# Run sslsniff on NVM Node.js
-sudo ./bpf/sslsniff --binary-path ~/.nvm/versions/node/v20.0.0/bin/node --verbose
-
-# Run browsertrace directly on Chrome
-sudo ./bpf/browsertrace --binary-path /opt/google/chrome/chrome
-
-# Run stdiocap directly on a local MCP server PID
-sudo ./bpf/stdiocap -p 12345
-
-# Run process tracer
-sudo ./bpf/process -c python
-```
-
-#### Web Interface Access
-
-All monitoring commands with `--server` flag provide web visualization at:
+During a session, visit [http://127.0.0.1:7395](http://127.0.0.1:7395) for live traffic, process trees, and metrics:
 - **Timeline View**: http://127.0.0.1:7395/timeline
 - **Process Tree**: http://127.0.0.1:7395/tree
-- **Raw Logs**: http://127.0.0.1:7395/logs
+- **Event Log**: http://127.0.0.1:7395/logs
+- **Metrics View**: http://127.0.0.1:7395/metrics
 
+For a saved SQLite session, run `agentsight report serve --db run.db` and open the same routes.
+
+<div align="center">
+  <img src="https://github.com/eunomia-bpf/agentsight/raw/master/docs/demo-tree.png" alt="AgentSight Demo - Process Tree Visualization" width="800">
+  <p><em>Process tree visualization for agent subprocesses and file activity</em></p>
+</div>
+
+<div align="center">
+  <img src="https://github.com/eunomia-bpf/agentsight/raw/master/docs/demo-timeline.png" alt="AgentSight Demo - Timeline Visualization" width="800">
+  <p><em>Timeline visualization for LLM, process, file, and network events</em></p>
+</div>
+
+<div align="center">
+  <img src="https://github.com/eunomia-bpf/agentsight/raw/master/docs/demo-metrics.png" alt="AgentSight Demo - Metrics Visualization" width="800">
+  <p><em>Metrics visualization for memory and CPU usage</em></p>
+</div>
+
+<div align="center">
+  <p><strong>Try the <a href="https://agentsight.us">live demo</a></strong> to explore a real recorded Claude Code session in the browser.</p>
+</div>
+
+### Supported Agents
+
+> **Privileges:** eBPF probes need root. Use `sudo` for live capture commands.
+
+`record` auto-discovers binaries, SSL libraries, and container processes. Works out of the box for:
+
+| Agent | Command |
+|-------|---------|
+| Claude Code | `sudo ./agentsight record -- claude` |
+| Gemini CLI | `sudo ./agentsight record -- gemini` |
+| Python (aider, open-interpreter, …) | `sudo ./agentsight record -c python` |
+| Docker containers (OpenClaw, …) | `sudo ./agentsight record -c node --binary-path docker://openclaw` |
+| Any command | `sudo ./agentsight record -- <command>` |
+
+See [docs/agents.md](https://github.com/eunomia-bpf/agentsight/blob/master/docs/agents.md) for agent-specific setup, SSL quirks, browser capture, MCP stdio, and advanced flags.
+
+### OpenTelemetry Export
+
+AgentSight can export captured LLM calls as OpenTelemetry **GenAI**
+(`gen_ai.*`) spans over OTLP/HTTP — standards-compliant agent telemetry for any
+agent, with zero in-process instrumentation.
+
+```bash
+sudo ./agentsight debug trace --otel --otel-endpoint http://localhost:4318
+```
+
+See [docs/otel.md](https://github.com/eunomia-bpf/agentsight/blob/master/docs/otel.md) for
+collector setup and backend integration.
 
 ## ❓ Frequently Asked Questions
 
-### General
-
-**Q: How does AgentSight differ from traditional APM tools?**
-A: AgentSight operates at the kernel level using eBPF, providing system-level monitoring that is independent of application code. Traditional APM requires instrumentation that can be modified or disabled.
+**Q: What permissions does AgentSight need?**
+A: eBPF probes need root privileges, so AgentSight may prompt for `sudo`. With `record -- <command>`, the monitored agent still runs as your normal user; only the probes are elevated.
 
 **Q: What's the performance impact?**
-A: Less than 3% CPU overhead due to optimized eBPF kernel-space data collection.
+A: Our evaluation reports less than 3% CPU overhead for typical traced agent workloads.
 
-**Q: Can agents detect they're being monitored?**  
-A: Detection is extremely difficult since monitoring occurs at the kernel level without code modification.
+**Q: Where does captured data go?**
+A: `record` stores sessions as `agentsight-*.db` files in the current directory by default, and `report` reads the latest matching file from that directory unless you pass `--db`. `monitor` stores its weekly background DBs under `~/.agentsight/monitor`, and `top` is read-only unless you explicitly pass `--db` to inspect a saved session. Use `agentsight report`, `agentsight report list`, `agentsight report audit --json`, and `agentsight report token` to inspect prior runs. Captured data can include prompts, responses, paths, headers, and network targets, so treat logs and DBs as sensitive.
 
-### Technical
+**Q: Why doesn't AgentSight capture traffic from Claude Code, Node.js, or Gemini CLI?**
+A: These applications statically link their SSL library (BoringSSL for Claude/Bun, OpenSSL for **all** Node.js — both NVM and system installs) into their own binary instead of using system `libssl.so`, so there's nothing for sslsniff to hook by default. AgentSight handles this for you: `record -- <command>` always discovers the binary, and `record -c node` now auto-discovers the Node binary too. For Claude attach mode, pass `--binary-path`. See the "Zero-Config: record" and "Monitoring Node.js AI Tools" sections.
 
-**Q: Which Linux distributions are supported?**
-A: Any distribution with kernel 4.1+ (5.0+ recommended). Tested on Ubuntu 20.04+, CentOS 8+, RHEL 8+.
-
-**Q: Can I monitor multiple agents simultaneously?**  
-A: Yes, use combined monitoring modes for concurrent multi-agent observation with correlation.
-
-**Q: How do I filter sensitive data?**  
-A: Built-in analyzers can remove authentication headers and filter specific content patterns.
-
-**Q: Why doesn't AgentSight capture traffic from Claude Code or NVM Node.js?**
-A: These applications statically link their SSL library (BoringSSL for Claude/Bun, OpenSSL for NVM Node.js) instead of using system `libssl.so`. Use `--binary-path` to point to the actual binary so AgentSight can auto-detect SSL functions via byte-pattern matching. See the "Monitoring Claude Code" and "Monitoring Node.js AI Tools" sections for examples.
-
-**Q: Why does `--comm claude` not capture SSL traffic?**
-A: Claude Code's SSL traffic runs on an internal "HTTP Client" thread, not the main "claude" thread. The `--comm` filter in sslsniff matches thread name (from `bpf_get_current_comm()`), not process name. When using `--binary-path`, the collector automatically skips the `--comm` filter for SSL monitoring.
-
-### Troubleshooting
-
-**Q: "Permission denied" errors**  
-A: Ensure you're running with `sudo` or have `CAP_BPF` and `CAP_SYS_ADMIN` capabilities.
-
-**Q: "Failed to load eBPF program" errors**
-A: Verify kernel version meets requirements (see Prerequisites). Update vmlinux.h for your architecture if needed.
-
+**Q: What should I check if tracing fails?**
+A: Verify you are on Linux with eBPF support, have `sudo` or `CAP_BPF`/`CAP_SYS_ADMIN`, and are using `record -- <command>` or the correct `--binary-path` for statically linked agents.
 
 ## 🤝 Contributing
 
-We welcome contributions! After cloning and building (see Installation above), you can:
+We welcome contributions! After cloning and building (see [docs/build.md](https://github.com/eunomia-bpf/agentsight/blob/master/docs/build.md)), you can:
 
 ```bash
 # Run tests
@@ -349,13 +224,12 @@ make -C bpf debug
 
 ### Key Resources
 
-- [CLAUDE.md](CLAUDE.md) - Project guidelines and architecture
-- [collector/DESIGN.md](collector/DESIGN.md) - Framework design details
-- [docs/why.md](docs/why.md) - Problem analysis and motivation
+- [CLAUDE.md](https://github.com/eunomia-bpf/agentsight/blob/master/CLAUDE.md) - Project guidelines and architecture
+- [docs/design/README.md](https://github.com/eunomia-bpf/agentsight/blob/master/docs/design/README.md) - archived design notes and research drafts
 
 ## 📄 License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License - see [LICENSE](https://github.com/eunomia-bpf/agentsight/blob/master/LICENSE) for details.
 
 ---
 

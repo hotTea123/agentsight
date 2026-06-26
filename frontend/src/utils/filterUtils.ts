@@ -1,177 +1,59 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 eunomia-bpf org.
 
-import { Event } from '@/types/event';
-import { ProcessNode, parseEventData } from './eventParsers';
+import {
+  ProcessNode,
+  TreeAuditEvent,
+  eventModel,
+  eventSearchText,
+  eventTarget,
+  timelineForProcess,
+  treeEventType,
+} from './eventParsers';
 import { ProcessTreeFilters } from '@/components/process-tree/ProcessTreeFilters';
 
-// Extract unique filter options from events
-export function extractFilterOptions(events: Event[]) {
+export function extractFilterOptions(processTree: ProcessNode[]) {
   const eventTypes = new Set<string>();
   const models = new Set<string>();
   const sources = new Set<string>();
   const commands = new Set<string>();
 
-  events.forEach(event => {
-    // Parse the event to get structured data
-    const parsedEvent = parseEventData(event);
-
-    // Skip system events
-    if (parsedEvent === null) {
-      return;
-    }
-
-    // Event types
-    eventTypes.add(parsedEvent.type);
-
-    // Sources
-    sources.add(event.source);
-
-    // Commands
-    if (event.comm) {
-      commands.add(event.comm);
-    }
-
-    // Models (extract from different event types)
-    if (parsedEvent.type === 'prompt' || parsedEvent.type === 'response') {
-      const model = parsedEvent.metadata?.model;
-      if (model && model !== 'Unknown Model') {
-        models.add(model);
-      }
-    }
+  visitProcesses(processTree, process => {
+    if (process.comm) commands.add(process.comm);
+    process.events.forEach(event => {
+      eventTypes.add(treeEventType(event));
+      sources.add(event.audit_type);
+      const model = eventModel(event);
+      if (model && model !== 'Unknown Model') models.add(model);
+    });
   });
 
   return {
     eventTypes: Array.from(eventTypes).sort(),
     models: Array.from(models).sort(),
     sources: Array.from(sources).sort(),
-    commands: Array.from(commands).sort()
+    commands: Array.from(commands).sort(),
   };
 }
 
-// Check if an event matches the filters
-export function eventMatchesFilters(event: Event, filters: ProcessTreeFilters): boolean {
-  const parsedEvent = parseEventData(event);
-
-  // Skip system events
-  if (parsedEvent === null) {
-    return false;
-  }
-
-  // Event type filter
-  if (filters.eventTypes.length > 0 && !filters.eventTypes.includes(parsedEvent.type)) {
-    return false;
-  }
-  
-  // Source filter
-  if (filters.sources.length > 0 && !filters.sources.includes(event.source)) {
-    return false;
-  }
-  
-  // Command filter
-  if (filters.commands.length > 0 && (!event.comm || !filters.commands.includes(event.comm))) {
-    return false;
-  }
-  
-  // Model filter
-  if (filters.models.length > 0) {
-    const model = parsedEvent.metadata?.model;
-    if (!model || !filters.models.includes(model)) {
-      return false;
-    }
-  }
-  
-  // Time range filter
-  if (filters.timeRange.start && event.timestamp < filters.timeRange.start) {
-    return false;
-  }
-  
-  if (filters.timeRange.end && event.timestamp > filters.timeRange.end) {
-    return false;
-  }
-  
-  // Search text filter
-  if (filters.searchText) {
-    const searchLower = filters.searchText.toLowerCase();
-    const searchableText = [
-      parsedEvent.title,
-      parsedEvent.content,
-      event.comm,
-      event.source,
-      parsedEvent.metadata?.model,
-      JSON.stringify(event.data)
-    ].filter(Boolean).join(' ').toLowerCase();
-    
-    if (!searchableText.includes(searchLower)) {
-      return false;
-    }
-  }
-  
-  return true;
-}
-
-// Filter events and return filtered events
-export function filterEvents(events: Event[], filters: ProcessTreeFilters): Event[] {
-  return events.filter(event => eventMatchesFilters(event, filters));
-}
-
-// Filter process tree by applying filters to events within each process
 export function filterProcessTree(processTree: ProcessNode[], filters: ProcessTreeFilters): ProcessNode[] {
-  return processTree.map(process => {
-    // Filter events within this process
-    const filteredEvents = process.events.filter(event => {
-      // Create a mock Event object from ParsedEvent for filtering
-      const mockEvent: Event = {
-        id: event.id,
-        timestamp: event.timestamp,
-        source: '', // We'll need to reconstruct this from metadata
-        pid: process.pid,
-        comm: process.comm,
-        data: event.metadata
-      };
-      
-      // Try to reconstruct source from event metadata
-      if (event.metadata?.original_source) {
-        mockEvent.source = event.metadata.original_source;
-      } else if (event.type === 'prompt' || event.type === 'response') {
-        mockEvent.source = 'http_parser';
-      } else if (event.type === 'stdio') {
-        mockEvent.source = 'stdio';
-      } else if (event.type === 'file') {
-        mockEvent.source = 'process';
-      } else if (event.type === 'process') {
-        mockEvent.source = 'process';
-      } else {
-        mockEvent.source = 'ssl';
-      }
-      
-      return eventMatchesFilters(mockEvent, filters);
-    });
-    
-    // Recursively filter children
-    const filteredChildren = filterProcessTree(process.children, filters);
-    
-    // Return process if it has filtered events or filtered children
-    if (filteredEvents.length > 0 || filteredChildren.length > 0) {
-      return {
-        ...process,
-        events: filteredEvents,
-        children: filteredChildren
-      };
-    }
-    
-    return null;
-  }).filter((process): process is ProcessNode => process !== null);
+  return processTree.flatMap(process => {
+    const events = process.events.filter(event => eventMatches(event, process.comm, filters));
+    const children = filterProcessTree(process.children, filters);
+    if (events.length === 0 && children.length === 0) return [];
+    const filtered = { ...process, events, children };
+    return [{ ...filtered, timeline: timelineForProcess(filtered) }];
+  });
 }
 
-// Get total event count from process tree
 export function getTotalEventCount(processTree: ProcessNode[]): number {
-  return processTree.reduce((total, process) => {
-    return total + process.events.length + getTotalEventCount(process.children);
-  }, 0);
+  let count = 0;
+  visitProcesses(processTree, process => {
+    count += process.events.length;
+  });
+  return count;
 }
 
-// Create default filters
 export function createDefaultFilters(): ProcessTreeFilters {
   return {
     eventTypes: [],
@@ -179,6 +61,32 @@ export function createDefaultFilters(): ProcessTreeFilters {
     sources: [],
     commands: [],
     searchText: '',
-    timeRange: {}
+    timeRange: {},
   };
+}
+
+function eventMatches(event: TreeAuditEvent, comm: string, filters: ProcessTreeFilters): boolean {
+  const type = treeEventType(event);
+  const model = eventModel(event);
+  const searchText = filters.searchText.toLowerCase();
+  if (filters.eventTypes.length > 0 && !filters.eventTypes.includes(type)) return false;
+  if (filters.sources.length > 0 && !filters.sources.includes(event.audit_type)) return false;
+  if (filters.commands.length > 0 && (!comm || !filters.commands.includes(comm))) return false;
+  if (filters.models.length > 0 && (!model || !filters.models.includes(model))) return false;
+  if (filters.timeRange.start && event.timestamp_ms < filters.timeRange.start) return false;
+  if (filters.timeRange.end && event.timestamp_ms > filters.timeRange.end) return false;
+  if (searchText && ![
+    comm,
+    eventModel(event),
+    eventTarget(event),
+    eventSearchText(event),
+  ].filter(Boolean).join(' ').toLowerCase().includes(searchText)) return false;
+  return true;
+}
+
+function visitProcesses(processes: ProcessNode[], visit: (process: ProcessNode) => void) {
+  processes.forEach(process => {
+    visit(process);
+    visitProcesses(process.children, visit);
+  });
 }

@@ -3,19 +3,20 @@
 
 'use client';
 
-import { ProcessedEvent } from '@/types/event';
-import { formatEventSummary } from '@/utils/eventProcessing';
+import { DisplayEvent, formatDisplayEventSummary } from '@/utils/eventProcessing';
+import { useTranslation } from '@/i18n';
 
 interface LogListProps {
-  events: ProcessedEvent[];
-  onEventClick: (event: ProcessedEvent) => void;
+  events: DisplayEvent[];
+  onEventClick: (event: DisplayEvent) => void;
 }
 
 export function LogList({ events, onEventClick }: LogListProps) {
+  const { t } = useTranslation();
   if (events.length === 0) {
     return (
       <div className="p-8 text-center text-gray-500">
-        No events found matching the current filters.
+        {t('log.noEvents')}
       </div>
     );
   }
@@ -39,7 +40,7 @@ export function LogList({ events, onEventClick }: LogListProps) {
                 </span>
               </div>
               <div className="text-sm text-gray-900 mb-1">
-                {formatEventSummary(event)}
+                {formatDisplayEventSummary(event)}
               </div>
               <div className="text-xs text-gray-500 font-mono">
                 ID: {event.id}

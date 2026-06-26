@@ -3,10 +3,11 @@
 
 'use client';
 
-import { ProcessedEvent } from '@/types/event';
+import { DisplayEvent } from '@/utils/eventProcessing';
+import { useTranslation } from '@/i18n';
 
 interface TimelineMinimapProps {
-  events: ProcessedEvent[];
+  events: DisplayEvent[];
   fullTimeRange: { start: number; end: number };
   visibleTimeRange: { start: number; end: number };
   baseTimeSpan: number;
@@ -17,7 +18,7 @@ interface TimelineMinimapProps {
 
 interface TimelineGroup {
   source: string;
-  events: ProcessedEvent[];
+  events: DisplayEvent[];
   color: string;
 }
 
@@ -30,9 +31,10 @@ export function TimelineMinimap({
   scrollOffset,
   onScrollChange
 }: TimelineMinimapProps) {
+  const { t } = useTranslation();
   // Group events by source for minimap
   const timelineGroups: TimelineGroup[] = [];
-  const grouped: { [source: string]: ProcessedEvent[] } = {};
+  const grouped: { [source: string]: DisplayEvent[] } = {};
   
   events.forEach(event => {
     if (!grouped[event.source]) {
@@ -62,9 +64,9 @@ export function TimelineMinimap({
   return (
     <div className="mb-4">
       <div className="flex items-center justify-between mb-2">
-        <span className="text-xs text-gray-600">Timeline Overview</span>
+        <span className="text-xs text-gray-600">{t('timeline.overview')}</span>
         <span className="text-xs text-gray-500">
-          {Math.round((scrollOffset / (baseTimeSpan - timeSpan)) * 100)}% scrolled
+          {t('timeline.scrolled', { percent: Math.round((scrollOffset / (baseTimeSpan - timeSpan)) * 100) })}
         </span>
       </div>
       <div 

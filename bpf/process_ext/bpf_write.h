@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
-#ifndef __PROCESS_NEW_BPF_WRITE_H
-#define __PROCESS_NEW_BPF_WRITE_H
+#ifndef __PROCESS_EXT_BPF_WRITE_H
+#define __PROCESS_EXT_BPF_WRITE_H
 
 /*
  * write-family syscall tracing: write/pwrite64/writev enter/exit pairing for
  * byte count aggregation.
- * write_ctx_map is defined in process_new.bpf.c (temporary context, not aggregation).
+ * write_ctx_map is defined by process_ext/bpf_state.h (temporary context, not aggregation).
  * Aggregation goes into event_agg_map with detail="fd=N" (later resolved to path in userspace).
  */
 
@@ -85,4 +85,4 @@ int trace_writev_exit(struct trace_event_raw_sys_exit *ctx)
 	return trace_write_exit_common(ctx->ret);
 }
 
-#endif /* __PROCESS_NEW_BPF_WRITE_H */
+#endif /* __PROCESS_EXT_BPF_WRITE_H */

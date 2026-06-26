@@ -4,42 +4,40 @@
 'use client';
 
 import { useState, useMemo } from 'react';
-import { Event, ProcessedEvent } from '@/types/event';
-import { processEvents, filterEvents } from '@/utils/eventProcessing';
+import { DisplayEvent, filterDisplayEvents } from '@/utils/eventProcessing';
 import { EventFilters } from '@/components/common/EventFilters';
 import { EventModal } from '@/components/common/EventModal';
 import { LogList } from './LogList';
+import { useTranslation } from '@/i18n';
 
 interface LogViewProps {
-  events: Event[];
+  events: DisplayEvent[];
 }
 
 export function LogView({ events }: LogViewProps) {
+  const { t } = useTranslation();
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedSource, setSelectedSource] = useState<string>('');
   const [selectedComm, setSelectedComm] = useState<string>('');
   const [selectedPid, setSelectedPid] = useState<string>('');
-  const [selectedEvent, setSelectedEvent] = useState<ProcessedEvent | null>(null);
-
-  // Process events with additional metadata
-  const processedEvents = useMemo(() => processEvents(events), [events]);
+  const [selectedEvent, setSelectedEvent] = useState<DisplayEvent | null>(null);
 
   // Filter events based on search, source, comm, and pid
   const filteredEvents = useMemo(() => {
-    return filterEvents(processedEvents, {
+    return filterDisplayEvents(events, {
       source: selectedSource,
       comm: selectedComm,
       pid: selectedPid,
       searchTerm
     });
-  }, [processedEvents, searchTerm, selectedSource, selectedComm, selectedPid]);
+  }, [events, searchTerm, selectedSource, selectedComm, selectedPid]);
 
   return (
     <div className="bg-white rounded-lg shadow-md">
       {/* Filters */}
       <div className="border-b border-gray-200 p-4">
         <EventFilters
-          events={processedEvents}
+          events={events}
           selectedSource={selectedSource}
           selectedComm={selectedComm}
           selectedPid={selectedPid}
@@ -60,11 +58,11 @@ export function LogView({ events }: LogViewProps) {
         />
       </div>
 
-      {/* Event Details Modal */}
+      {/* Event details modal */}
       <EventModal
         event={selectedEvent}
         onClose={() => setSelectedEvent(null)}
-        title="Log Event Details"
+        title={t('log.eventDetails')}
       />
     </div>
   );

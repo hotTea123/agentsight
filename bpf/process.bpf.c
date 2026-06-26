@@ -5,6 +5,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 #include "process.h"
+#include "process_ext/bpf_state.h"
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
@@ -22,6 +23,8 @@ struct {
 
 const volatile unsigned long long min_duration_ns = 0;
 
+#include "process_ext/bpf_common.h"
+
 /* Bash readline uretprobe handler */
 SEC("uretprobe//usr/bin/bash:readline")
 int BPF_URETPROBE(bash_readline, const void *ret)
@@ -31,6 +34,8 @@ int BPF_URETPROBE(bash_readline, const void *ret)
 	u32 pid;
 
 	if (!ret)
+		return 0;
+	if (!is_cgroup_tracked())
 		return 0;
 
 	/* Check if this is actually bash */
@@ -70,6 +75,9 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	pid_t pid;
 	u64 ts;
 
+	if (!is_cgroup_tracked())
+		return 0;
+
 	/* Get process info */
 	pid = bpf_get_current_pid_tgid() >> 32;
 	task = (struct task_struct *)bpf_get_current_task();
@@ -104,26 +112,43 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	unsigned long arg_end = BPF_CORE_READ(mm, arg_end);
 	unsigned long arg_len = arg_end - arg_start;
 
-	/* Limit to buffer size */
 	if (arg_len > MAX_COMMAND_LEN - 1)
 		arg_len = MAX_COMMAND_LEN - 1;
 
-	/* Read command line from userspace memory */
 	if (arg_len > 0) {
-		long ret = bpf_probe_read_user_str(&e->full_command, arg_len + 1, (void *)arg_start);
+		/*
+		 * Read the full argv block using bpf_probe_read_user (not _str).
+		 * _str stops at first \0 and only captures argv[0].
+		 * _user reads raw bytes: "chmod\0+x\0/path\0" -- we get all args.
+		 *
+		 * We always read exactly MAX_COMMAND_LEN-1 bytes (a compile-time
+		 * constant) so that BPF verifiers on all kernel versions can
+		 * prove the access is bounded.  This may read past arg_end into
+		 * environment variables, but userspace trims to arg_len.
+		 *
+		 * NO LOOPS in BPF -- all post-processing (\0->space, trimming)
+		 * is done in userspace to stay within the verifier instruction
+		 * limit on kernel 5.15 (1,000,000 insns).
+		 */
+		long ret = bpf_probe_read_user(e->full_command,
+					MAX_COMMAND_LEN - 1,
+					(void *)arg_start);
 		if (ret < 0) {
-			/* Fallback to just comm if we can't read cmdline */
-			bpf_probe_read_kernel_str(&e->full_command, sizeof(e->full_command), e->comm);
+			bpf_probe_read_kernel_str(e->full_command,
+					  sizeof(e->full_command),
+					  e->comm);
+			e->full_command[MAX_COMMAND_LEN - 1] = '\0';
 		} else {
-			/* Replace null bytes with spaces for readability */
-			for (int i = 0; i < MAX_COMMAND_LEN - 1 && i < ret - 1; i++) {
-				if (e->full_command[i] == '\0')
-					e->full_command[i] = ' ';
-			}
+			e->full_command[MAX_COMMAND_LEN - 1] = '\0';
 		}
+		/* Store actual arg_len in exit_code for userspace trimming.
+		 * exec events don't use exit_code, so this field is free. */
+		arg_len &= (MAX_COMMAND_LEN - 1);
+		e->exit_code = (unsigned)arg_len;
 	} else {
-		/* No arguments, use comm */
-		bpf_probe_read_kernel_str(&e->full_command, sizeof(e->full_command), e->comm);
+		bpf_probe_read_kernel_str(e->full_command,
+				  sizeof(e->full_command), e->comm);
+		e->exit_code = 0;
 	}
 
 	/* successfully submit it to user-space for post-processing */
@@ -138,6 +163,9 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 	struct event *e;
 	pid_t pid, tid;
 	u64 id, ts, *start_ts, duration_ns = 0;
+
+	if (!is_cgroup_tracked())
+		return 0;
 
 	/* get PID and TID of exiting thread/process */
 	id = bpf_get_current_pid_tgid();
@@ -178,6 +206,15 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 	e->exit_code = (BPF_CORE_READ(task, exit_code) >> 8) & 0xff;
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
+	{
+		struct exit_mem_info mem = {};
+		mem.hiwater_rss = BPF_CORE_READ(task, signal, maxrss);
+		if (mem.hiwater_rss > 0) {
+			u32 pid_key = pid;
+			bpf_map_update_elem(&exit_mem, &pid_key, &mem, BPF_ANY);
+		}
+	}
+
 	/* send data to user-space for post-processing */
 	bpf_ringbuf_submit(e, 0);
 	return 0;
@@ -192,6 +229,9 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
 	char filepath[MAX_FILENAME_LEN];
 	int dfd, flags;
 	const char *filename;
+
+	if (!is_cgroup_tracked())
+		return 0;
 
 	pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -240,6 +280,9 @@ int trace_open(struct trace_event_raw_sys_enter *ctx)
 	int flags;
 	const char *filename;
 
+	if (!is_cgroup_tracked())
+		return 0;
+
 	pid = bpf_get_current_pid_tgid() >> 32;
 
 	/* Get syscall arguments */
@@ -276,4 +319,9 @@ int trace_open(struct trace_event_raw_sys_enter *ctx)
 	return 0;
 }
 
-
+#include "process_ext/bpf_fs.h"
+#include "process_ext/bpf_write.h"
+#include "process_ext/bpf_net.h"
+#include "process_ext/bpf_signals.h"
+#include "process_ext/bpf_mem.h"
+#include "process_ext/bpf_cow.h"

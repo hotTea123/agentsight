@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 eunomia-bpf org.
+
+use serde_json::Value;
+
+pub(crate) fn short_session_id(id: &str) -> String {
+    let id = id.trim();
+    if id.is_empty() {
+        return "session".to_string();
+    }
+    let compact = id
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(id)
+        .trim_end_matches(".jsonl");
+    const MAX_SESSION_ID_CHARS: usize = 12;
+    if compact.chars().count() <= MAX_SESSION_ID_CHARS {
+        return compact.to_string();
+    }
+    let head = compact.chars().take(6).collect::<String>();
+    let tail = compact
+        .chars()
+        .rev()
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{head}.{tail}")
+}
+
+pub(crate) fn sanitize_ascii_identifier(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+pub(crate) fn truncate_text(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        text.chars().take(max.saturating_sub(1)).collect()
+    }
+}
+
+pub(crate) fn truncate_with_ellipsis(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        format!(
+            "{}...",
+            text.chars().take(max.saturating_sub(3)).collect::<String>()
+        )
+    }
+}
+
+pub(crate) fn clean_prompt_text(text: &str) -> Option<String> {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = text
+        .strip_prefix("<session>")
+        .and_then(|text| text.strip_suffix("</session>"))
+        .unwrap_or(&text)
+        .trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+pub(crate) fn extract_prompt_text(value: &Value) -> Option<String> {
+    if let Some(prompt) = value.get("prompt").and_then(Value::as_str) {
+        return clean_prompt_text(prompt);
+    }
+    let mut parts = Vec::new();
+    for key in ["messages", "contents"] {
+        if let Some(items) = value.get(key).and_then(Value::as_array) {
+            for item in items {
+                collect_content_text(item.get("content").unwrap_or(item), &mut parts);
+            }
+        }
+    }
+    clean_prompt_text(&parts.join(" "))
+}
+
+fn collect_content_text(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => out.push(text.clone()),
+        Value::Array(items) => items
+            .iter()
+            .for_each(|item| collect_content_text(item, out)),
+        Value::Object(obj) => {
+            for key in ["text", "content", "parts"] {
+                if let Some(value) = obj.get(key) {
+                    collect_content_text(value, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}

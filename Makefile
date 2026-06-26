@@ -1,3 +1,6 @@
+SYNC_VENDOR ?= 0
+
+build: SYNC_VENDOR=1
 build: build-frontend build-bpf build-rust
 
 build-frontend:
@@ -7,7 +10,7 @@ build-bpf:
 	make -C bpf
 
 build-rust:
-	cd collector && cargo build --release
+	cd collector && AGENTSIGHT_SYNC_VENDOR=$(SYNC_VENDOR) cargo build --release
 
 clean:
 	make -C bpf clean

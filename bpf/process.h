@@ -6,7 +6,7 @@
 #define TASK_COMM_LEN 16
 #define MAX_FILENAME_LEN 127
 #define MAX_COMMAND_FILTERS 10
-#define MAX_TRACKED_PIDS 1024
+#define MAX_TRACKED_PIDS 4096
 #define MAX_COMMAND_LEN 256
 
 enum filter_mode {
