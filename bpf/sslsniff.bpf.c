@@ -341,15 +341,15 @@ int BPF_UPROBE(probe_rustls_buffer_plaintext, void *state,
     return 0;
 }
 
-SEC("uprobe/do_handshake")
-int BPF_UPROBE(probe_SSL_rw_enter, void *ssl, void *buf, int num) {
+static __always_inline int SSL_rw_enter(void *ssl, void *buf,
+                                        u8 tls_library)
+{
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     u32 tid = pid_tgid;
     u32 uid = bpf_get_current_uid_gid();
     u64 ts = bpf_ktime_get_ns();
     u64 handle = (u64)ssl;
-    u8 tls_library = (u8)bpf_get_attach_cookie(ctx);
 
     if (!trace_allowed(uid, pid)) {
         return 0;
@@ -361,6 +361,30 @@ int BPF_UPROBE(probe_SSL_rw_enter, void *ssl, void *buf, int num) {
     bpf_map_update_elem(&transport_handles, &tid, &handle, BPF_ANY);
     bpf_map_update_elem(&tls_libraries, &tid, &tls_library, BPF_ANY);
     return 0;
+}
+
+SEC("uprobe/openssl_SSL_rw")
+int BPF_UPROBE(probe_openssl_SSL_rw_enter, void *ssl, void *buf, int num)
+{
+    return SSL_rw_enter(ssl, buf, TLS_LIBRARY_OPENSSL);
+}
+
+SEC("uprobe/gnutls_SSL_rw")
+int BPF_UPROBE(probe_gnutls_SSL_rw_enter, void *ssl, void *buf, int num)
+{
+    return SSL_rw_enter(ssl, buf, TLS_LIBRARY_GNUTLS);
+}
+
+SEC("uprobe/nss_SSL_rw")
+int BPF_UPROBE(probe_nss_SSL_rw_enter, void *ssl, void *buf, int num)
+{
+    return SSL_rw_enter(ssl, buf, TLS_LIBRARY_NSS);
+}
+
+SEC("uprobe/boringssl_SSL_rw")
+int BPF_UPROBE(probe_boringssl_SSL_rw_enter, void *ssl, void *buf, int num)
+{
+    return SSL_rw_enter(ssl, buf, TLS_LIBRARY_BORINGSSL);
 }
 
 static int SSL_exit(struct pt_regs *ctx, int rw) {
@@ -456,15 +480,15 @@ int BPF_URETPROBE(probe_SSL_write_exit) {
     return (SSL_exit(ctx, 1));
 }
 
-SEC("uprobe/SSL_write_ex")
-int BPF_UPROBE(probe_SSL_write_ex_enter, void *ssl, void *buf, size_t num, size_t *readbytes) {
+static __always_inline int SSL_ex_enter(void *ssl, void *buf,
+                                        size_t *readbytes, u8 tls_library)
+{
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     u32 tid = (u32)pid_tgid;
     u32 uid = bpf_get_current_uid_gid();
     u64 ts = bpf_ktime_get_ns();
     u64 handle = (u64)ssl;
-    u8 tls_library = (u8)bpf_get_attach_cookie(ctx);
 
     if (!trace_allowed(uid, pid)) {
         return 0;
@@ -480,28 +504,32 @@ int BPF_UPROBE(probe_SSL_write_ex_enter, void *ssl, void *buf, size_t num, size_
     return 0;
 }
 
-SEC("uprobe/SSL_read_ex")
-int BPF_UPROBE(probe_SSL_read_ex_enter, void *ssl, void *buf, size_t num, size_t *readbytes) {
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 pid = pid_tgid >> 32;
-    u32 tid = (u32)pid_tgid;
-    u32 uid = bpf_get_current_uid_gid();
-    u64 ts = bpf_ktime_get_ns();
-    u64 handle = (u64)ssl;
-    u8 tls_library = (u8)bpf_get_attach_cookie(ctx);
+SEC("uprobe/openssl_SSL_write_ex")
+int BPF_UPROBE(probe_openssl_SSL_write_ex_enter, void *ssl, void *buf,
+               size_t num, size_t *readbytes)
+{
+    return SSL_ex_enter(ssl, buf, readbytes, TLS_LIBRARY_OPENSSL);
+}
 
-    if (!trace_allowed(uid, pid)) {
-        return 0;
-    }
+SEC("uprobe/openssl_SSL_read_ex")
+int BPF_UPROBE(probe_openssl_SSL_read_ex_enter, void *ssl, void *buf,
+               size_t num, size_t *readbytes)
+{
+    return SSL_ex_enter(ssl, buf, readbytes, TLS_LIBRARY_OPENSSL);
+}
 
-    bpf_map_update_elem(&bufs, &tid, &buf, BPF_ANY);
-    bpf_map_update_elem(&start_ns, &tid, &ts, BPF_ANY); 
-    bpf_map_update_elem(&transport_handles, &tid, &handle, BPF_ANY);
-    bpf_map_update_elem(&tls_libraries, &tid, &tls_library, BPF_ANY);
+SEC("uprobe/boringssl_SSL_write_ex")
+int BPF_UPROBE(probe_boringssl_SSL_write_ex_enter, void *ssl, void *buf,
+               size_t num, size_t *readbytes)
+{
+    return SSL_ex_enter(ssl, buf, readbytes, TLS_LIBRARY_BORINGSSL);
+}
 
-    bpf_map_update_elem(&readbytes_ptrs, &tid, &readbytes, BPF_ANY);
-
-    return 0;
+SEC("uprobe/boringssl_SSL_read_ex")
+int BPF_UPROBE(probe_boringssl_SSL_read_ex_enter, void *ssl, void *buf,
+               size_t num, size_t *readbytes)
+{
+    return SSL_ex_enter(ssl, buf, readbytes, TLS_LIBRARY_BORINGSSL);
 }
 
 static int ex_SSL_exit(struct pt_regs *ctx, int rw, int len) {
@@ -628,15 +656,14 @@ int BPF_URETPROBE(probe_SSL_read_ex_exit)
     return ex_SSL_exit(ctx, 0, len);
 }
 
-SEC("uprobe/do_handshake")
-int BPF_UPROBE(probe_SSL_do_handshake_enter, void *ssl) {
+static __always_inline int SSL_do_handshake_enter(void *ssl, u8 tls_library)
+{
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     u32 tid = (u32)pid_tgid;
     u64 ts = bpf_ktime_get_ns();
     u32 uid = bpf_get_current_uid_gid();
     u64 handle = (u64)ssl;
-    u8 tls_library = (u8)bpf_get_attach_cookie(ctx);
 
     if (!trace_allowed(uid, pid)) {
         return 0;
@@ -647,6 +674,18 @@ int BPF_UPROBE(probe_SSL_do_handshake_enter, void *ssl) {
     bpf_map_update_elem(&transport_handles, &tid, &handle, BPF_ANY);
     bpf_map_update_elem(&tls_libraries, &tid, &tls_library, BPF_ANY);
     return 0;
+}
+
+SEC("uprobe/openssl_do_handshake")
+int BPF_UPROBE(probe_openssl_SSL_do_handshake_enter, void *ssl)
+{
+    return SSL_do_handshake_enter(ssl, TLS_LIBRARY_OPENSSL);
+}
+
+SEC("uprobe/boringssl_do_handshake")
+int BPF_UPROBE(probe_boringssl_SSL_do_handshake_enter, void *ssl)
+{
+    return SSL_do_handshake_enter(ssl, TLS_LIBRARY_BORINGSSL);
 }
 
 SEC("uretprobe/do_handshake")
@@ -710,8 +749,7 @@ int BPF_URETPROBE(probe_SSL_do_handshake_exit) {
     return 0;
 }
 
-SEC("uprobe/TLS_close")
-int BPF_UPROBE(probe_TLS_close, void *handle)
+static __always_inline int TLS_close(void *handle, u8 tls_library)
 {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
@@ -737,11 +775,29 @@ int BPF_UPROBE(probe_TLS_close, void *handle)
     data->buf_filled = 0;
     data->rw = 2;
     data->is_handshake = false;
-    data->tls_library = (u8)bpf_get_attach_cookie(ctx);
+    data->tls_library = tls_library;
     data->connection_closed = true;
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
     bpf_ringbuf_submit(data, 0);
     return 0;
+}
+
+SEC("uprobe/openssl_TLS_close")
+int BPF_UPROBE(probe_openssl_TLS_close, void *handle)
+{
+    return TLS_close(handle, TLS_LIBRARY_OPENSSL);
+}
+
+SEC("uprobe/gnutls_TLS_close")
+int BPF_UPROBE(probe_gnutls_TLS_close, void *handle)
+{
+    return TLS_close(handle, TLS_LIBRARY_GNUTLS);
+}
+
+SEC("uprobe/nss_TLS_close")
+int BPF_UPROBE(probe_nss_TLS_close, void *handle)
+{
+    return TLS_close(handle, TLS_LIBRARY_NSS);
 }
 
 char LICENSE[] SEC("license") = "GPL";
