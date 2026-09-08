@@ -215,7 +215,12 @@ def run_test():
         )
         tracer.send_signal(signal.SIGINT)
         tracer.wait(timeout=10)
-        assert_true(tracer.returncode == 0, f"sslsniff exited with {tracer.returncode}")
+        with open(stderr_path, "r", encoding="utf-8", errors="replace") as stream:
+            tracer_stderr = stream.read()
+        assert_true(
+            tracer.returncode == 0,
+            f"sslsniff exited with {tracer.returncode}: {tracer_stderr}",
+        )
 
         events = load_events(stdout_path)
         assert_common_metadata(events, pid)
