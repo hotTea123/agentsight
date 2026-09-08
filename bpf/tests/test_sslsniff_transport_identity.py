@@ -113,8 +113,8 @@ def assert_common_metadata(events, pid):
     assert_true(events, "sslsniff emitted no events")
     assert_true(all(event.get("pid") == pid for event in events),
                 "PID filter allowed an event from another process")
-    assert_true(all(event.get("tls_library") == "openssl" for event in events),
-                "TLS library identity was not propagated as openssl")
+    assert_true(all(event.get("tls_library") == "boringssl" for event in events),
+                "symbol-bearing BoringSSL was not classified as boringssl")
 
     process_starts = {event.get("process_start_ns") for event in events}
     assert_true(len(process_starts) == 1 and next(iter(process_starts)) > 0,

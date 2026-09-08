@@ -788,6 +788,12 @@ int BPF_UPROBE(probe_openssl_TLS_close, void *handle)
     return TLS_close(handle, TLS_LIBRARY_OPENSSL);
 }
 
+SEC("uprobe/boringssl_TLS_close")
+int BPF_UPROBE(probe_boringssl_TLS_close, void *handle)
+{
+    return TLS_close(handle, TLS_LIBRARY_BORINGSSL);
+}
+
 SEC("uprobe/gnutls_TLS_close")
 int BPF_UPROBE(probe_gnutls_TLS_close, void *handle)
 {

@@ -18,6 +18,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <gelf.h>
+#include <libelf.h>
 
 #include "sslsniff.skel.h"
 #include "sslsniff.h"
@@ -196,6 +198,53 @@ struct boringssl_offsets {
 	bool found;
 	const char *source;
 };
+
+static bool elf_has_symbol(const char *binary_path, const char *symbol_name)
+{
+	Elf *elf = NULL;
+	Elf_Scn *section = NULL;
+	int fd = -1;
+	bool found = false;
+
+	if (elf_version(EV_CURRENT) == EV_NONE)
+		return false;
+	fd = open(binary_path, O_RDONLY);
+	if (fd < 0)
+		return false;
+	elf = elf_begin(fd, ELF_C_READ, NULL);
+	if (!elf)
+		goto out;
+	while ((section = elf_nextscn(elf, section)) != NULL) {
+		GElf_Shdr header;
+		Elf_Data *data = NULL;
+
+		if (!gelf_getshdr(section, &header)
+			|| (header.sh_type != SHT_SYMTAB && header.sh_type != SHT_DYNSYM)
+			|| header.sh_entsize == 0)
+			continue;
+		while ((data = elf_getdata(section, data)) != NULL) {
+			size_t count = data->d_size / header.sh_entsize;
+
+			for (size_t i = 0; i < count; i++) {
+				GElf_Sym symbol;
+				const char *name;
+
+				if (!gelf_getsym(data, (int)i, &symbol))
+					continue;
+				name = elf_strptr(elf, header.sh_link, symbol.st_name);
+				if (name && strcmp(name, symbol_name) == 0) {
+					found = true;
+					goto out;
+				}
+			}
+		}
+	}
+out:
+	if (elf)
+		elf_end(elf);
+	close(fd);
+	return found;
+}
 
 static size_t find_pattern(const unsigned char *data, size_t data_len,
 						   const unsigned char *pattern, size_t pattern_len)
@@ -443,6 +492,26 @@ int attach_openssl(struct sslsniff_bpf *skel, const char *lib) {
 	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_do_handshake,
 						   probe_SSL_do_handshake_exit);
 	ATTACH_UPROBE_OPTIONAL(skel, lib, SSL_free, probe_openssl_TLS_close);
+
+	return 0;
+}
+
+int attach_boringssl(struct sslsniff_bpf *skel, const char *lib) {
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_write, probe_boringssl_SSL_rw_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_write, probe_SSL_write_exit);
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_read, probe_boringssl_SSL_rw_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_read, probe_SSL_read_exit);
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_write_ex,
+						probe_boringssl_SSL_write_ex_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_write_ex, probe_SSL_write_ex_exit);
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_read_ex,
+						probe_boringssl_SSL_read_ex_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_read_ex, probe_SSL_read_ex_exit);
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_do_handshake,
+						probe_boringssl_SSL_do_handshake_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_do_handshake,
+						   probe_SSL_do_handshake_exit);
+	ATTACH_UPROBE_OPTIONAL(skel, lib, SSL_free, probe_boringssl_TLS_close);
 
 	return 0;
 }
@@ -900,6 +969,8 @@ int main(int argc, char **argv) {
 	// Handle custom binary path for statically-linked SSL (e.g., NVM Node.js, Bun apps)
 	if (env.extra_lib) {
 		size_t attach_mark = attach_link_count;
+		bool symbol_boringssl = elf_has_symbol(
+			env.extra_lib, "OPENSSL_is_boringssl");
 
 		err = -ENOENT;
 
@@ -914,7 +985,9 @@ int main(int argc, char **argv) {
 		}
 		// Try the real symbol attachments directly. A disposable probe link here
 		// leaks in libbpf's perf-event fallback under LeakSanitizer.
-		err = attach_openssl(obj, env.extra_lib);
+		err = symbol_boringssl
+			? attach_boringssl(obj, env.extra_lib)
+			: attach_openssl(obj, env.extra_lib);
 		if (err)
 			destroy_attach_links_since(attach_mark);
 		if (!err) {
