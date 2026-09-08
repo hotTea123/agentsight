@@ -47,11 +47,15 @@ static int keep_attach_link(struct bpf_link *link)
 	return 0;
 }
 
+static void destroy_attach_links_since(size_t mark)
+{
+	while (attach_link_count > mark)
+		bpf_link__destroy(attach_links[--attach_link_count]);
+}
+
 static void destroy_attach_links(void)
 {
-	for (size_t i = 0; i < attach_link_count; i++)
-		bpf_link__destroy(attach_links[i]);
-	attach_link_count = 0;
+	destroy_attach_links_since(0);
 }
 
 #define __ATTACH_UPROBE(skel, binary_path, sym_name, prog_name, is_retprobe)   \
@@ -850,7 +854,11 @@ int main(int argc, char **argv) {
 					openssl_path ? openssl_path : "not found");
 
 		if (openssl_path) {
-			attach_openssl(obj, openssl_path);
+			size_t attach_mark = attach_link_count;
+
+			err = attach_openssl(obj, openssl_path);
+			if (err)
+				destroy_attach_links_since(attach_mark);
 		} else {
 			warn("OpenSSL library not found\n");
 		}
@@ -861,7 +869,11 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "GnuTLS path: %s\n", gnutls_path ? gnutls_path : "not found");
 		}
 		if (gnutls_path) {
-			attach_gnutls(obj, gnutls_path);
+			size_t attach_mark = attach_link_count;
+
+			err = attach_gnutls(obj, gnutls_path);
+			if (err)
+				destroy_attach_links_since(attach_mark);
 		} else {
 			warn("GnuTLS library not found\n");
 		}
@@ -872,7 +884,11 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "NSS path: %s\n", nss_path ? nss_path : "not found");
 		}
 		if (nss_path) {
-			attach_nss(obj, nss_path);
+			size_t attach_mark = attach_link_count;
+
+			err = attach_nss(obj, nss_path);
+			if (err)
+				destroy_attach_links_since(attach_mark);
 		} else {
 			warn("NSS library not found\n");
 		}
@@ -880,6 +896,8 @@ int main(int argc, char **argv) {
 
 	// Handle custom binary path for statically-linked SSL (e.g., NVM Node.js, Bun apps)
 	if (env.extra_lib) {
+		size_t attach_mark = attach_link_count;
+
 		err = -ENOENT;
 
 		if (verbose) {
@@ -894,6 +912,8 @@ int main(int argc, char **argv) {
 		// Try the real symbol attachments directly. A disposable probe link here
 		// leaks in libbpf's perf-event fallback under LeakSanitizer.
 		err = attach_openssl(obj, env.extra_lib);
+		if (err)
+			destroy_attach_links_since(attach_mark);
 		if (!err) {
 			if (verbose)
 				fprintf(stderr, "Using symbol-based attachment for %s\n", env.extra_lib);
