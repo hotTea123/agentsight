@@ -62,6 +62,18 @@
 #define ATTACH_URETPROBE_CHECKED(skel, binary_path, sym_name, prog_name)  \
 	__ATTACH_UPROBE_CHECKED(skel, binary_path, sym_name, prog_name, true)
 
+#define ATTACH_UPROBE_OPTIONAL(skel, binary_path, sym_name, prog_name)     \
+	do {                                                                    \
+	  __ATTACH_UPROBE(skel, binary_path, sym_name, prog_name, false);       \
+	  long __err = libbpf_get_error(skel->links.prog_name);                 \
+	  if (__err) {                                                          \
+		skel->links.prog_name = NULL;                                       \
+		if (verbose)                                                        \
+		  warn("Lifecycle symbol " #sym_name " unavailable in %s: %ld\n", \
+		       binary_path, __err);                                         \
+	  }                                                                     \
+	} while (false)
+
 #define __ATTACH_UPROBE_OFFSET(skel, binary_path, offset, prog_name, is_retprobe) \
 	do {                                                                          \
 	  LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .retprobe = is_retprobe);         \
@@ -148,9 +160,6 @@ static bool verbose = false;
 static struct bpf_link *codex_rustls_links[CODEX_MAX_RUSTLS_OFFSETS];
 static size_t codex_rustls_link_count;
 static struct bpf_link *grok_rustls_link;
-#define MAX_LIFECYCLE_LINKS 3
-static struct bpf_link *lifecycle_links[MAX_LIFECYCLE_LINKS];
-static size_t lifecycle_link_count;
 
 /*
  * BoringSSL function offset detection for stripped binaries.
@@ -398,36 +407,6 @@ static void sig_int(int signo) {
 	exiting = 1;
 }
 
-static int attach_lifecycle(struct bpf_program *program, const char *lib,
-					const char *symbol)
-{
-	LIBBPF_OPTS(bpf_uprobe_opts, opts, .func_name = symbol,
-			  .retprobe = false);
-	struct bpf_link *link = bpf_program__attach_uprobe_opts(
-		program, env.pid, lib, 0, &opts);
-	long err = link ? libbpf_get_error(link) : -(errno ? errno : EIO);
-
-	if (err) {
-		if (verbose)
-			warn("Lifecycle symbol %s unavailable in %s: %ld\n",
-			     symbol, lib, err);
-		return 0;
-	}
-	if (lifecycle_link_count >= MAX_LIFECYCLE_LINKS) {
-		bpf_link__destroy(link);
-		return -E2BIG;
-	}
-	lifecycle_links[lifecycle_link_count++] = link;
-	return 0;
-}
-
-static void destroy_lifecycle_links(void)
-{
-	for (size_t i = 0; i < lifecycle_link_count; i++)
-		bpf_link__destroy(lifecycle_links[i]);
-	lifecycle_link_count = 0;
-}
-
 int attach_openssl(struct sslsniff_bpf *skel, const char *lib) {
 	ATTACH_UPROBE_CHECKED(skel, lib, SSL_write, probe_openssl_SSL_rw_enter);
 	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_write, probe_SSL_write_exit);
@@ -445,7 +424,7 @@ int attach_openssl(struct sslsniff_bpf *skel, const char *lib) {
 						probe_openssl_SSL_do_handshake_enter);
 	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_do_handshake,
 						   probe_SSL_do_handshake_exit);
-	attach_lifecycle(skel->progs.probe_openssl_TLS_close, lib, "SSL_free");
+	ATTACH_UPROBE_OPTIONAL(skel, lib, SSL_free, probe_openssl_TLS_close);
 
 	return 0;
 }
@@ -459,7 +438,7 @@ int attach_gnutls(struct sslsniff_bpf *skel, const char *lib) {
 						probe_gnutls_SSL_rw_enter);
 	ATTACH_URETPROBE_CHECKED(skel, lib, gnutls_record_recv,
 						   probe_SSL_read_exit);
-	attach_lifecycle(skel->progs.probe_gnutls_TLS_close, lib, "gnutls_deinit");
+	ATTACH_UPROBE_OPTIONAL(skel, lib, gnutls_deinit, probe_gnutls_TLS_close);
 
 	return 0;
 }
@@ -473,7 +452,7 @@ int attach_nss(struct sslsniff_bpf *skel, const char *lib) {
 	ATTACH_URETPROBE_CHECKED(skel, lib, PR_Read, probe_SSL_read_exit);
 	ATTACH_UPROBE_CHECKED(skel, lib, PR_Recv, probe_nss_SSL_rw_enter);
 	ATTACH_URETPROBE_CHECKED(skel, lib, PR_Recv, probe_SSL_read_exit);
-	attach_lifecycle(skel->progs.probe_nss_TLS_close, lib, "PR_Close");
+	ATTACH_UPROBE_OPTIONAL(skel, lib, PR_Close, probe_nss_TLS_close);
 
 	return 0;
 }
@@ -979,7 +958,6 @@ int main(int argc, char **argv) {
 cleanup:
 	if (obj)
 		sslsniff_bpf__detach(obj);
-	destroy_lifecycle_links();
 	if (grok_rustls_link)
 		bpf_link__destroy(grok_rustls_link);
 	destroy_codex_rustls_links();
