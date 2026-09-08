@@ -29,32 +29,45 @@
 #define INVALID_PID -1
 #define DEFAULT_BUFFER_SIZE 8192
 
+#define MAX_ATTACH_LINKS 40
+static struct bpf_link *attach_links[MAX_ATTACH_LINKS];
+static size_t attach_link_count;
+
+static int keep_attach_link(struct bpf_link *link)
+{
+	long err = link ? libbpf_get_error(link) : -(errno ? errno : EIO);
+
+	if (err)
+		return (int)err;
+	if (attach_link_count >= MAX_ATTACH_LINKS) {
+		bpf_link__destroy(link);
+		return -E2BIG;
+	}
+	attach_links[attach_link_count++] = link;
+	return 0;
+}
+
+static void destroy_attach_links(void)
+{
+	for (size_t i = 0; i < attach_link_count; i++)
+		bpf_link__destroy(attach_links[i]);
+	attach_link_count = 0;
+}
+
 #define __ATTACH_UPROBE(skel, binary_path, sym_name, prog_name, is_retprobe)   \
 	do {                                                                       \
 	  LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .func_name = #sym_name,        \
 				  .retprobe = is_retprobe);                                    \
-	  skel->links.prog_name = bpf_program__attach_uprobe_opts(                 \
-		  skel->progs.prog_name, env.pid, binary_path, 0, &uprobe_opts);       \
-	} while (false)
-
-#define __CHECK_PROGRAM(skel, prog_name)               \
-	do {                                               \
-	  long __err = libbpf_get_error(skel->links.prog_name); \
-	  if (__err) {                                     \
-		skel->links.prog_name = NULL;                  \
-		return (int)__err;                             \
-	  }                                                \
-	  if (!skel->links.prog_name) {                    \
-		perror("no program attached for " #prog_name); \
-		return -(errno ? errno : ENOENT);              \
-	  }                                                \
+	  int __err = keep_attach_link(bpf_program__attach_uprobe_opts(            \
+		  skel->progs.prog_name, env.pid, binary_path, 0, &uprobe_opts));      \
+	  if (__err)                                                               \
+		return __err;                                                         \
 	} while (false)
 
 #define __ATTACH_UPROBE_CHECKED(skel, binary_path, sym_name, prog_name,     \
 								is_retprobe)                                \
 	do {                                                                    \
 	  __ATTACH_UPROBE(skel, binary_path, sym_name, prog_name, is_retprobe); \
-	  __CHECK_PROGRAM(skel, prog_name);                                     \
 	} while (false)
 
 #define ATTACH_UPROBE_CHECKED(skel, binary_path, sym_name, prog_name)     \
@@ -64,33 +77,34 @@
 
 #define ATTACH_UPROBE_OPTIONAL(skel, binary_path, sym_name, prog_name)     \
 	do {                                                                    \
-	  __ATTACH_UPROBE(skel, binary_path, sym_name, prog_name, false);       \
-	  long __err = libbpf_get_error(skel->links.prog_name);                 \
+	  LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .func_name = #sym_name,     \
+				  .retprobe = false);                                        \
+	  int __err = keep_attach_link(bpf_program__attach_uprobe_opts(         \
+		  skel->progs.prog_name, env.pid, binary_path, 0, &uprobe_opts));   \
 	  if (__err) {                                                          \
-		skel->links.prog_name = NULL;                                       \
 		if (verbose)                                                        \
 		  warn("Lifecycle symbol " #sym_name " unavailable in %s: %ld\n", \
-		       binary_path, __err);                                         \
+		       binary_path, (long)__err);                                   \
 	  }                                                                     \
 	} while (false)
 
 #define __ATTACH_UPROBE_OFFSET(skel, binary_path, offset, prog_name, is_retprobe) \
 	do {                                                                          \
 	  LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .retprobe = is_retprobe);         \
-	  skel->links.prog_name = bpf_program__attach_uprobe_opts(                    \
-		  skel->progs.prog_name, env.pid, binary_path, offset, &uprobe_opts);     \
+	  int __err = keep_attach_link(bpf_program__attach_uprobe_opts(               \
+		  skel->progs.prog_name, env.pid, binary_path, offset, &uprobe_opts));    \
+	  if (__err)                                                                  \
+		return __err;                                                            \
 	} while (false)
 
 #define ATTACH_UPROBE_OFFSET_CHECKED(skel, binary_path, offset, prog_name)       \
 	do {                                                                         \
 	  __ATTACH_UPROBE_OFFSET(skel, binary_path, offset, prog_name, false);       \
-	  __CHECK_PROGRAM(skel, prog_name);                                          \
 	} while (false)
 
 #define ATTACH_URETPROBE_OFFSET_CHECKED(skel, binary_path, offset, prog_name)    \
 	do {                                                                         \
 	  __ATTACH_UPROBE_OFFSET(skel, binary_path, offset, prog_name, true);        \
-	  __CHECK_PROGRAM(skel, prog_name);                                          \
 	} while (false)
 
 volatile sig_atomic_t exiting = 0;
@@ -958,6 +972,7 @@ int main(int argc, char **argv) {
 cleanup:
 	if (obj)
 		sslsniff_bpf__detach(obj);
+	destroy_attach_links();
 	if (grok_rustls_link)
 		bpf_link__destroy(grok_rustls_link);
 	destroy_codex_rustls_links();
