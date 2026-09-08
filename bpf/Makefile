@@ -31,14 +31,14 @@ CFLAGS += $(ASAN_FLAGS)
 ALL_LDFLAGS += $(ASAN_FLAGS)
 endif
 
-APPS = sslsniff stdiocap process test_process_utils test_process_filter test_process_ext_map_flush test_process_ext_types test_codex_offsets test_sslsniff_transport_identity # minimal minimal_legacy uprobe kprobe fentry usdt sockfilter tc ksyscall
+APPS = sslsniff stdiocap process test_process_utils test_process_filter test_process_ext_map_flush test_process_ext_types test_codex_offsets test_sslsniff_transport_identity test_sslsniff_transport_identity_boringssl # minimal minimal_legacy uprobe kprobe fentry usdt sockfilter tc ksyscall
 
 # Experimental programs: built only via `make experimental` (or by name), not
 # shipped in the default build or embedded into the collector.
 EXPERIMENTAL_APPS = browsertrace
 
 # All test programs (no BPF skeleton needed)
-TEST_APPS = test_process_utils test_process_filter test_process_ext_map_flush test_process_ext_types test_codex_offsets test_sslsniff_transport_identity
+TEST_APPS = test_process_utils test_process_filter test_process_ext_map_flush test_process_ext_types test_codex_offsets test_sslsniff_transport_identity test_sslsniff_transport_identity_boringssl
 
 CARGO ?= $(shell which cargo)
 ifeq ($(strip $(CARGO)),)
@@ -138,7 +138,7 @@ unit-test: test_process_utils test_process_filter test_process_ext_map_flush tes
 	@echo "Running codex offset tests..."
 	@./test_codex_offsets
 
-runtime-test: process stdiocap sslsniff test_sslsniff_transport_identity
+runtime-test: process stdiocap sslsniff test_sslsniff_transport_identity test_sslsniff_transport_identity_boringssl
 	@echo ""
 	@echo "Running process runtime tests..."
 	@if [ "$$(id -u)" -eq 0 ]; then \
@@ -250,6 +250,10 @@ $(OUTPUT)/test_sslsniff_transport_identity.o: tests/test_sslsniff_transport_iden
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) -O0 -fno-inline -pthread -c $< -o $@
 
+$(OUTPUT)/test_sslsniff_transport_identity_boringssl.o: tests/test_sslsniff_transport_identity.c | $(OUTPUT)
+	$(call msg,CC,$@)
+	$(Q)$(CC) $(CFLAGS) -O0 -fno-inline -pthread -DBORINGSSL_FIXTURE -c $< -o $@
+
 $(OUTPUT)/%.o: %.c $(wildcard %.h) | $(OUTPUT)
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $(filter %.c,$^) -o $@
@@ -286,6 +290,10 @@ test_codex_offsets: $(OUTPUT)/test_codex_offsets.o | $(OUTPUT)
 	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -o $@
 
 test_sslsniff_transport_identity: $(OUTPUT)/test_sslsniff_transport_identity.o | $(OUTPUT)
+	$(call msg,BINARY,$@)
+	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -pthread -Wl,--export-dynamic -o $@
+
+test_sslsniff_transport_identity_boringssl: $(OUTPUT)/test_sslsniff_transport_identity_boringssl.o | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -pthread -Wl,--export-dynamic -o $@
 

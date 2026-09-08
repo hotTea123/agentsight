@@ -16,6 +16,7 @@ from pathlib import Path
 BPF_DIR = Path(__file__).resolve().parents[1]
 SSLSNIFF = BPF_DIR / "sslsniff"
 FIXTURE = BPF_DIR / "test_sslsniff_transport_identity"
+BORINGSSL_FIXTURE = BPF_DIR / "test_sslsniff_transport_identity_boringssl"
 MAIN_MARKERS = [
     "identity-main-a-1",
     "identity-main-b-1",
@@ -109,12 +110,12 @@ def parse_handle(value):
     return int(value, 16)
 
 
-def assert_common_metadata(events, pid):
+def assert_common_metadata(events, pid, expected_library):
     assert_true(events, "sslsniff emitted no events")
     assert_true(all(event.get("pid") == pid for event in events),
                 "PID filter allowed an event from another process")
-    assert_true(all(event.get("tls_library") == "boringssl" for event in events),
-                "symbol-bearing BoringSSL was not classified as boringssl")
+    assert_true(all(event.get("tls_library") == expected_library for event in events),
+                f"TLS events were not classified as {expected_library}")
 
     process_starts = {event.get("process_start_ns") for event in events}
     assert_true(len(process_starts) == 1 and next(iter(process_starts)) > 0,
@@ -142,9 +143,9 @@ def assert_payload_metadata(event, marker, function):
     assert_true("bytes_lost" not in event, f"unexpected loss count for {marker}: {event}")
 
 
-def run_test():
+def run_test(fixture_path, expected_library):
     fixture = subprocess.Popen(
-        [str(FIXTURE)],
+        [str(fixture_path)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -179,7 +180,7 @@ def run_test():
                     "--pid",
                     str(pid),
                     "--binary-path",
-                    str(FIXTURE),
+                    str(fixture_path),
                     "--verbose",
                 ],
                 stdout=tracer_stdout,
@@ -223,7 +224,7 @@ def run_test():
         )
 
         events = load_events(stdout_path)
-        assert_common_metadata(events, pid)
+        assert_common_metadata(events, pid, expected_library)
 
         main_events = [event for event in events if event.get("data") in MAIN_MARKERS]
         assert_true(len(main_events) == len(MAIN_MARKERS),
@@ -412,11 +413,12 @@ def main():
     if os.geteuid() != 0:
         print("sslsniff transport identity runtime test requires root", file=sys.stderr)
         return 1
-    for path in (SSLSNIFF, FIXTURE):
+    for path in (SSLSNIFF, FIXTURE, BORINGSSL_FIXTURE):
         if not path.exists():
             print(f"missing test binary: {path}", file=sys.stderr)
             return 1
-    run_test()
+    run_test(FIXTURE, "openssl")
+    run_test(BORINGSSL_FIXTURE, "boringssl")
     run_final_loss_test()
     print("sslsniff transport identity runtime tests passed")
     return 0

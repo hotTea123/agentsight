@@ -25,10 +25,12 @@ static char truncated_payload[TRUNCATED_PAYLOAD_SIZE + 1];
 static _Atomic int result_sink;
 static pthread_barrier_t worker_barrier;
 
+#ifdef BORINGSSL_FIXTURE
 EXPORTED_NOINLINE int OPENSSL_is_boringssl(void)
 {
 	return 1;
 }
+#endif
 
 struct worker_result {
 	long tid;
