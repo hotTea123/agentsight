@@ -860,7 +860,10 @@ fn parse_jsonl(
                 let payload = obj.get("payload").unwrap_or(&Value::Null);
                 let ptype = payload.get("type").and_then(Value::as_str).unwrap_or("");
                 if ptype == "token_count"
-                    && let Some(usage) = payload.pointer("/info/total_token_usage")
+                    && let Some(usage) = payload
+                        .pointer("/info/total_token_usage")
+                        .filter(|usage| !usage.is_null())
+                        .or_else(|| payload.pointer("/info/last_token_usage"))
                 {
                     let name = if codex_model.is_empty() {
                         "unknown"
@@ -2647,6 +2650,8 @@ pub fn codex_total_token_usage(content: &str) -> Option<TokenUsage> {
         }
         payload
             .pointer("/info/total_token_usage")
+            .filter(|usage| !usage.is_null())
+            .or_else(|| payload.pointer("/info/last_token_usage"))
             .map(codex_token_usage)
     })
 }
@@ -5108,6 +5113,34 @@ mod tests {
         assert_eq!(session.usage.cache_read_tokens, 9_984);
         assert_eq!(session.usage.output_tokens, 11);
         assert_eq!(session.usage.total_tokens, 19_195);
+    }
+
+    #[test]
+    fn codex_latest_usage_falls_back_when_cumulative_usage_is_null() {
+        let content = concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-agentsight-mock"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":null,"last_token_usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":5,"total_tokens":15}}}}"#,
+        );
+
+        let session = parse_session_content(
+            AGENT_CODEX,
+            &PathBuf::from("/tmp/session.jsonl"),
+            UNIX_EPOCH,
+            content,
+        )
+        .expect("session");
+
+        assert_eq!(session.usage.input_tokens, 6);
+        assert_eq!(session.usage.cache_read_tokens, 4);
+        assert_eq!(session.usage.output_tokens, 5);
+        assert_eq!(session.usage.total_tokens, 15);
+        assert_eq!(
+            codex_total_token_usage(content)
+                .expect("latest usage")
+                .total_tokens,
+            15
+        );
     }
 
     #[test]
