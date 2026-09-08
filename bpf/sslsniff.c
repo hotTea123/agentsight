@@ -898,23 +898,15 @@ int main(int argc, char **argv) {
 				 env.extra_lib, strerror(errno));
 			goto cleanup;
 		}
-		// First try symbol-based attachment (works for binaries with symbols)
-		LIBBPF_OPTS(bpf_uprobe_opts, test_opts, .func_name = "SSL_write",
-					.retprobe = false);
-		struct bpf_link *test_link = bpf_program__attach_uprobe_opts(
-			obj->progs.probe_openssl_SSL_rw_enter, env.pid, env.extra_lib, 0,
-			&test_opts);
-		long test_err = test_link ? libbpf_get_error(test_link) : -(errno ? errno : EIO);
-		if (test_link && !test_err) {
-			// Symbol found - use standard symbol-based attachment
-			bpf_link__destroy(test_link);
+		// Try the real symbol attachments directly. A disposable probe link here
+		// leaks in libbpf's perf-event fallback under LeakSanitizer.
+		err = attach_openssl(obj, env.extra_lib);
+		if (!err) {
 			if (verbose)
 				fprintf(stderr, "Using symbol-based attachment for %s\n", env.extra_lib);
-			err = attach_openssl(obj, env.extra_lib);
-		} else if (test_err != -ENOENT) {
-			err = (int)test_err;
+		} else if (err != -ENOENT) {
 			warn("Failed to probe SSL_write in %s: libbpf error %ld\n",
-				 env.extra_lib, test_err);
+				 env.extra_lib, (long)err);
 		} else {
 			// Some stripped static clients use rustls; other clients use
 			// the existing generic BoringSSL detector.
