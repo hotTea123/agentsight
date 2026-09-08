@@ -855,9 +855,10 @@ int main(int argc, char **argv) {
 
 		if (openssl_path) {
 			size_t attach_mark = attach_link_count;
+			int attach_err;
 
-			err = attach_openssl(obj, openssl_path);
-			if (err)
+			attach_err = attach_openssl(obj, openssl_path);
+			if (attach_err)
 				destroy_attach_links_since(attach_mark);
 		} else {
 			warn("OpenSSL library not found\n");
@@ -870,9 +871,10 @@ int main(int argc, char **argv) {
 		}
 		if (gnutls_path) {
 			size_t attach_mark = attach_link_count;
+			int attach_err;
 
-			err = attach_gnutls(obj, gnutls_path);
-			if (err)
+			attach_err = attach_gnutls(obj, gnutls_path);
+			if (attach_err)
 				destroy_attach_links_since(attach_mark);
 		} else {
 			warn("GnuTLS library not found\n");
@@ -885,9 +887,10 @@ int main(int argc, char **argv) {
 		}
 		if (nss_path) {
 			size_t attach_mark = attach_link_count;
+			int attach_err;
 
-			err = attach_nss(obj, nss_path);
-			if (err)
+			attach_err = attach_nss(obj, nss_path);
+			if (attach_err)
 				destroy_attach_links_since(attach_mark);
 		} else {
 			warn("NSS library not found\n");
