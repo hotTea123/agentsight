@@ -50,6 +50,32 @@ def read_line_with_timeout(stream, timeout):
     return line.strip()
 
 
+def wait_for_file(path, tracer, predicate, timeout, description):
+    deadline = time.monotonic() + timeout
+    contents = ""
+    while time.monotonic() < deadline:
+        with open(path, "r", encoding="utf-8", errors="replace") as stream:
+            contents = stream.read()
+        if predicate(contents):
+            return contents
+        if tracer.poll() is not None:
+            raise RuntimeTestError(
+                f"sslsniff exited before {description} with {tracer.returncode}: {contents}"
+            )
+        time.sleep(0.02)
+    raise RuntimeTestError(f"timed out waiting for {description}: {contents}")
+
+
+def wait_for_process_stop(process, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pid, status = os.waitpid(process.pid, os.WNOHANG | os.WUNTRACED)
+        if pid == process.pid and os.WIFSTOPPED(status):
+            return
+        time.sleep(0.02)
+    raise RuntimeTestError("timed out waiting for sslsniff to stop")
+
+
 def parse_fields(line, prefix):
     assert_true(line.startswith(prefix), f"unexpected fixture output: {line!r}")
     return dict(re.findall(r"([a-z_]+)=([^ ]+)", line))
@@ -154,17 +180,19 @@ def run_test():
                     str(pid),
                     "--binary-path",
                     str(FIXTURE),
+                    "--verbose",
                 ],
                 stdout=tracer_stdout,
                 stderr=tracer_stderr,
             )
 
-        time.sleep(1.5)
-        if tracer.poll() is not None:
-            with open(stderr_path, "r", encoding="utf-8", errors="replace") as stream:
-                raise RuntimeTestError(
-                    f"sslsniff exited during attach with {tracer.returncode}: {stream.read()}"
-                )
+        wait_for_file(
+            stderr_path,
+            tracer,
+            lambda output: "SSLSNIFF_READY" in output,
+            10,
+            "tracer readiness",
+        )
 
         fixture.stdin.write("x")
         fixture.stdin.flush()
@@ -178,7 +206,13 @@ def run_test():
         read_tid = int(worker_fields["read_tid"])
         assert_true(write_tid != read_tid, "fixture workers unexpectedly shared a TID")
 
-        time.sleep(0.5)
+        wait_for_file(
+            stdout_path,
+            tracer,
+            lambda output: output.count('"connection_closed":true') >= 2,
+            10,
+            "captured lifecycle events",
+        )
         tracer.send_signal(signal.SIGINT)
         tracer.wait(timeout=10)
         assert_true(tracer.returncode == 0, f"sslsniff exited with {tracer.returncode}")
@@ -272,6 +306,103 @@ def run_test():
                 pass
 
 
+def run_final_loss_test():
+    fixture = subprocess.Popen(
+        [str(FIXTURE)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    tracer = None
+    stdout_file = tempfile.NamedTemporaryFile(
+        prefix="sslsniff-loss-", suffix=".jsonl", delete=False
+    )
+    stderr_file = tempfile.NamedTemporaryFile(
+        prefix="sslsniff-loss-", suffix=".stderr", delete=False
+    )
+    stdout_path = stdout_file.name
+    stderr_path = stderr_file.name
+    stdout_file.close()
+    stderr_file.close()
+
+    try:
+        ready = parse_fields(read_line_with_timeout(fixture.stdout, 5), "READY")
+        pid = int(ready["pid"])
+        with open(stdout_path, "wb") as tracer_stdout, open(
+            stderr_path, "wb"
+        ) as tracer_stderr:
+            tracer = subprocess.Popen(
+                [
+                    str(SSLSNIFF),
+                    "--no-openssl",
+                    "--pid",
+                    str(pid),
+                    "--binary-path",
+                    str(FIXTURE),
+                    "--verbose",
+                ],
+                stdout=tracer_stdout,
+                stderr=tracer_stderr,
+            )
+
+        wait_for_file(
+            stderr_path,
+            tracer,
+            lambda output: "SSLSNIFF_READY" in output,
+            10,
+            "tracer readiness",
+        )
+        tracer.send_signal(signal.SIGSTOP)
+        wait_for_process_stop(tracer, 5)
+
+        fixture.stdin.write("l")
+        fixture.stdin.flush()
+        remaining_stdout, fixture_stderr = fixture.communicate(timeout=10)
+        assert_true(
+            fixture.returncode == 0 and "LOSS_DONE" in remaining_stdout,
+            f"loss fixture failed with {fixture.returncode}: {fixture_stderr}",
+        )
+
+        tracer.send_signal(signal.SIGTERM)
+        tracer.send_signal(signal.SIGCONT)
+        tracer.wait(timeout=10)
+        assert_true(tracer.returncode == 0, f"sslsniff exited with {tracer.returncode}")
+
+        events = load_events(stdout_path)
+        loss_events = [event for event in events if event.get("function") == "CAPTURE_LOSS"]
+        assert_true(len(loss_events) == 1, f"expected one final loss event: {loss_events}")
+        loss = loss_events[0]
+        assert_true(loss.get("pid") == pid, f"final loss event has wrong PID: {loss}")
+        assert_true(
+            loss.get("ringbuf_reserve_failures", 0) > 0,
+            f"final loss event did not report reservation failures: {loss}",
+        )
+        assert_true(events[-1] == loss, "final loss event was not the last JSONL record")
+        assert_true(
+            [event.get("capture_seq") for event in events]
+            == list(range(1, len(events) + 1)),
+            "capture_seq did not include final loss output order",
+        )
+    finally:
+        if tracer and tracer.poll() is None:
+            tracer.send_signal(signal.SIGCONT)
+            tracer.send_signal(signal.SIGINT)
+            try:
+                tracer.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                tracer.kill()
+                tracer.wait(timeout=5)
+        if fixture.poll() is None:
+            fixture.kill()
+            fixture.wait(timeout=5)
+        for path in (stdout_path, stderr_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 def main():
     if os.geteuid() != 0:
         print("sslsniff transport identity runtime test requires root", file=sys.stderr)
@@ -281,6 +412,7 @@ def main():
             print(f"missing test binary: {path}", file=sys.stderr)
             return 1
     run_test()
+    run_final_loss_test()
     print("sslsniff transport identity runtime tests passed")
     return 0
 

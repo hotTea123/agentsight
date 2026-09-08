@@ -82,6 +82,8 @@
 	} while (false)
 
 volatile sig_atomic_t exiting = 0;
+static unsigned long long capture_seq;
+static unsigned long long last_reported_capture_loss;
 
 const char *argp_program_version = "sslsniff 0.1";
 const char *argp_program_bug_address = "https://github.com/iovisor/bcc/tree/master/libbpf-tools";
@@ -634,7 +636,6 @@ static const char *rw_event_name(int rw)
 // Function to print the event from the perf buffer in JSON format
 void print_event(struct probe_SSL_data_t *event, const char *evt) {
 	static unsigned long long start = 0;  // Use static to retain value across function calls
-	static unsigned long long capture_seq = 0;
 	unsigned int buf_size;
 
 	// Safety check for global buffer
@@ -689,6 +690,8 @@ void print_event(struct probe_SSL_data_t *event, const char *evt) {
 	printf("\"process_start_ns\":%llu,", event->process_start_ns);
 	printf("\"ringbuf_reserve_failures\":%llu,",
 	       event->ringbuf_reserve_failures);
+	if (event->ringbuf_reserve_failures > last_reported_capture_loss)
+		last_reported_capture_loss = event->ringbuf_reserve_failures;
 	printf("\"tls_library\":\"%s\",", tls_library_name(event->tls_library));
 	printf("\"connection_closed\":%s,",
 	       event->connection_closed ? "true" : "false");
@@ -736,6 +739,43 @@ void print_event(struct probe_SSL_data_t *event, const char *evt) {
 	// Close JSON object
 	printf("}\n");
 	fflush(stdout);
+}
+
+static unsigned long long current_timestamp_ns(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return (unsigned long long)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void report_final_capture_loss(struct sslsniff_bpf *obj)
+{
+	unsigned long long failures;
+	unsigned int key = 0;
+	int map_fd;
+
+	if (!obj)
+		return;
+	map_fd = bpf_map__fd(obj->maps.capture_loss);
+	if (map_fd < 0 || bpf_map_lookup_elem(map_fd, &key, &failures) != 0) {
+		if (verbose)
+			warn("failed to read final ring-buffer loss count: %s\n",
+			     strerror(errno));
+		return;
+	}
+	if (failures <= last_reported_capture_loss)
+		return;
+
+	printf("{\"function\":\"CAPTURE_LOSS\",");
+	printf("\"timestamp_ns\":%llu,", current_timestamp_ns());
+	printf("\"capture_seq\":%llu,", ++capture_seq);
+	printf("\"comm\":\"sslsniff\",");
+	printf("\"pid\":%d,", env.pid == INVALID_PID ? 0 : env.pid);
+	printf("\"ringbuf_reserve_failures\":%llu}\n", failures);
+	fflush(stdout);
+	last_reported_capture_loss = failures;
 }
 
 static int handle_event(void *ctx, void *data, size_t data_sz) {
@@ -924,10 +964,15 @@ int main(int argc, char **argv) {
 		goto cleanup;
 	}
 
-	if (signal(SIGINT, sig_int) == SIG_ERR) {
+	if (signal(SIGINT, sig_int) == SIG_ERR ||
+	    signal(SIGTERM, sig_int) == SIG_ERR) {
 		warn("can't set signal handler: %s\n", strerror(errno));
 		err = 1;
 		goto cleanup;
+	}
+	if (verbose) {
+		fprintf(stderr, "SSLSNIFF_READY\n");
+		fflush(stderr);
 	}
 
 	while (!exiting) {
@@ -940,10 +985,22 @@ int main(int argc, char **argv) {
 	}
 
 cleanup:
+	if (obj)
+		sslsniff_bpf__detach(obj);
 	destroy_lifecycle_links();
 	if (grok_rustls_link)
 		bpf_link__destroy(grok_rustls_link);
 	destroy_codex_rustls_links();
+	if (rb) {
+		int drain_err;
+
+		do {
+			drain_err = ring_buffer__poll(rb, 0);
+		} while (drain_err > 0);
+		if (drain_err < 0 && drain_err != -EINTR && verbose)
+			warn("error draining ring buffer: %s\n", strerror(-drain_err));
+	}
+	report_final_capture_loss(obj);
 	if (event_buf) {
 		free(event_buf);
 		event_buf = NULL;

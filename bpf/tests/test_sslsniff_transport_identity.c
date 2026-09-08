@@ -12,6 +12,7 @@
 #define EXPORTED_NOINLINE __attribute__((noinline, visibility("default")))
 #define CAPTURE_LIMIT (256 * 1024)
 #define TRUNCATED_PAYLOAD_SIZE (CAPTURE_LIMIT + 17)
+#define LOSS_BURST_EVENTS 96
 
 struct fake_ssl {
 	unsigned int id;
@@ -139,6 +140,16 @@ int main(void)
 	       (long)getpid(), main_tid, (void *)&handle_a, (void *)&handle_b);
 	if (read(STDIN_FILENO, &trigger, 1) != 1) {
 		fprintf(stderr, "fixture did not receive trigger\n");
+		return 1;
+	}
+	if (trigger == 'l') {
+		for (int i = 0; i < LOSS_BURST_EVENTS; i++)
+			write_marker(&handle_a, "loss-burst");
+		printf("LOSS_DONE\n");
+		return 0;
+	}
+	if (trigger != 'x') {
+		fprintf(stderr, "unknown fixture trigger: %c\n", trigger);
 		return 1;
 	}
 
