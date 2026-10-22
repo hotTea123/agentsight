@@ -4,6 +4,11 @@ This is the second stage of the TLS identity work in #208 and #210. It consumes
 the additive capture metadata from #210; it does not change the BPF probes,
 ring-buffer allocation, provider adapters, or agent-native session parsing.
 
+This document describes the stage-2 baseline. The subsequent
+[incremental SSE stage](sse-aggregation.md) replaces complete-body buffering for
+uncompressed, transport-identified SSE responses; the identity and persistence
+contracts below still apply.
+
 ## Identity and processing order
 
 For captures with a nonzero `transport_handle`, a nonzero `process_start_ns`,
