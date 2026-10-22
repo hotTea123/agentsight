@@ -13,6 +13,10 @@ use futures::stream::StreamExt;
 use loona_hpack::Decoder as HpackDecoder;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
+#[cfg(test)]
+#[path = "http_stream_tests.rs"]
+mod stream_tests;
+
 const MAX_HTTP1_STREAMS: usize = 1024;
 const MAX_HTTP1_CAPTURE_FRAGMENTS: usize = 4096;
 
@@ -48,6 +52,14 @@ struct HTTP1ConnectionState {
     response_metadata: FragmentBuffer,
     pending: VecDeque<(String, bool)>,
     next_request_seq: u64,
+    response_sse: Option<HTTP1SseStream>,
+}
+
+struct HTTP1SseStream {
+    message: HTTPMessage,
+    chunked: bool,
+    remaining: Option<usize>,
+    metadata: MessageMetadata,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -458,6 +470,7 @@ impl HTTPParser {
         let mut events = Vec::new();
         if let Some(mut state) = self.http1.remove(&connection.id) {
             if completion_reason == "closed"
+                && state.response_sse.is_none()
                 && !state.response_buffer.is_empty()
                 && let Some((message, consumed)) = parse_next_http1_message(
                     &state.response_buffer,
@@ -823,12 +836,63 @@ impl HTTP1ConnectionState {
             HTTP2Direction::Response => (&mut self.response_buffer, &mut self.response_metadata),
         };
         metadata.push(bytes.len(), event);
-        while let Some((message, consumed)) = parse_next_http1_message(
-            buffer,
-            direction,
-            self.pending.front().is_some_and(|(_, head)| *head),
-            false,
-        ) {
+        loop {
+            if direction == HTTP2Direction::Response && connection.exact {
+                if self.response_sse.is_none()
+                    && self.pending.front().is_some_and(|(_, head)| !head)
+                    && let Some((stream, consumed)) = start_http1_sse(buffer)
+                {
+                    self.response_sse = Some(stream);
+                    let stream = self.response_sse.as_mut().unwrap();
+                    metadata.consume(consumed, &mut stream.metadata);
+                    buffer.drain(..consumed);
+                }
+                if let Some(stream) = self.response_sse.as_mut() {
+                    match drain_http1_sse(buffer, stream) {
+                        Ok(Some((payload, consumed, ended))) => {
+                            metadata.consume(consumed, &mut stream.metadata);
+                            buffer.drain(..consumed);
+                            let mut message_event = event.clone();
+                            message_event.data =
+                                serde_json::to_value(stream.metadata.capture.finish()).unwrap();
+                            let mut output = HTTPParser::create_http_event(
+                                tid,
+                                stream.message.clone(),
+                                &message_event,
+                                include_raw_data,
+                                connection,
+                                self.pending.front().map(|(id, _)| id.clone()),
+                                Some("h1_connection_fifo"),
+                            );
+                            set_response_chunk(&mut output, &payload, ended, include_raw_data);
+                            events.push(output);
+                            if ended {
+                                self.response_sse = None;
+                                self.pending.pop_front();
+                            }
+                            continue;
+                        }
+                        Ok(None) => break,
+                        Err(()) => {
+                            events.push(correlation_diagnostic_event(
+                                event,
+                                connection,
+                                "truncated",
+                                "invalid_sse_transfer_framing",
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+            let Some((message, consumed)) = parse_next_http1_message(
+                buffer,
+                direction,
+                self.pending.front().is_some_and(|(_, head)| *head),
+                false,
+            ) else {
+                break;
+            };
             buffer.drain(..consumed);
             let mut capture = MessageMetadata::default();
             metadata.consume(consumed, &mut capture);
@@ -893,6 +957,103 @@ impl HTTP1ConnectionState {
 
         Some(events)
     }
+}
+
+fn is_uncompressed_sse(headers: &HashMap<String, String>) -> bool {
+    headers.get("content-type").is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+    }) && headers
+        .get("content-encoding")
+        .is_none_or(|value| value.eq_ignore_ascii_case("identity"))
+}
+
+fn start_http1_sse(buffer: &[u8]) -> Option<(HTTP1SseStream, usize)> {
+    let consumed = find_bytes(buffer, b"\r\n\r\n")? + 4;
+    let mut message =
+        HTTPParser::parse_http_message(&String::from_utf8_lossy(&buffer[..consumed]))?;
+    if message.message_type != HTTPMessageType::Response
+        || !message
+            .status_code
+            .is_some_and(|code| code >= 200 && code != 204 && code != 304)
+        || !is_uncompressed_sse(&message.headers)
+    {
+        return None;
+    }
+    let remaining = match http1_content_length(&buffer[..consumed - 4]) {
+        Http1ContentLength::Absent => None,
+        Http1ContentLength::Valid(length) => Some(length),
+        Http1ContentLength::Invalid => return None,
+    };
+    let chunked = http1_header_is_chunked(&buffer[..consumed - 4]);
+    message.headers.remove("transfer-encoding");
+    message.headers.remove("content-length");
+    Some((
+        HTTP1SseStream {
+            message,
+            chunked,
+            remaining,
+            metadata: MessageMetadata::default(),
+        },
+        consumed,
+    ))
+}
+
+// Return at most one transfer chunk. The caller retains unconsumed framing and
+// loops so a following keep-alive response in the same TLS record is not lost.
+fn drain_http1_sse(
+    buffer: &[u8],
+    state: &mut HTTP1SseStream,
+) -> Result<Option<(Vec<u8>, usize, bool)>, ()> {
+    if state.chunked {
+        let Some(line_end) = find_crlf(buffer, 0) else {
+            return Ok(None);
+        };
+        let size = parse_chunk_size(&buffer[..line_end]).ok_or(())?;
+        if size == 0 {
+            return match chunked_message_end(buffer, 0) {
+                ChunkedEnd::Complete(end) => Ok(Some((Vec::new(), end, true))),
+                ChunkedEnd::Incomplete => Ok(None),
+                ChunkedEnd::Malformed => Err(()),
+            };
+        }
+        let start = line_end + 2;
+        let end = start.checked_add(size).ok_or(())?;
+        let consumed = end.checked_add(2).ok_or(())?;
+        if consumed > buffer.len() {
+            return Ok(None);
+        }
+        if &buffer[end..consumed] != b"\r\n" {
+            return Err(());
+        }
+        Ok(Some((buffer[start..end].to_vec(), consumed, false)))
+    } else {
+        let take = state.remaining.unwrap_or(buffer.len()).min(buffer.len());
+        let ended = if let Some(remaining) = state.remaining.as_mut() {
+            *remaining -= take;
+            *remaining == 0
+        } else {
+            false
+        };
+        Ok((take > 0 || ended).then(|| (buffer[..take].to_vec(), take, ended)))
+    }
+}
+
+fn set_response_chunk(event: &mut Event, payload: &[u8], end_stream: bool, include_raw_data: bool) {
+    use serde_json::json;
+    event.data["message_type"] = json!("response_chunk");
+    event.data["body"] = json!(String::from_utf8_lossy(payload));
+    event.data["body_hex"] = json!(hex::encode(payload));
+    event.data["has_body"] = json!(!payload.is_empty());
+    event.data["content_length"] = json!(payload.len());
+    event.data["total_size"] = json!(payload.len());
+    event.data["end_stream"] = json!(end_stream);
+    event.data["completion_reason"] = json!(end_stream.then_some("done"));
+    event.data["raw_data"] = json!(include_raw_data.then(|| String::from_utf8_lossy(payload)));
+    // The entire HTTP response's provenance so far, not an additive chunk sum.
+    event.data["capture_metadata_scope"] = json!("http_message");
 }
 
 fn parse_next_http1_message(
@@ -1407,6 +1568,31 @@ impl HTTP2State {
                             }
                         }
                         HTTP2Direction::Response => {
+                            if connection.exact && is_uncompressed_sse(&state.response_headers) {
+                                if !state.response_emitted {
+                                    let ended = frame.flags & 0x1 != 0;
+                                    let mut output = create_http2_response_event(
+                                        connection,
+                                        tid,
+                                        frame.stream_id,
+                                        state,
+                                        original_event,
+                                        include_raw_data,
+                                    );
+                                    set_response_chunk(
+                                        &mut output,
+                                        payload,
+                                        ended,
+                                        include_raw_data,
+                                    );
+                                    events.push(output);
+                                    state.response_emitted = ended;
+                                }
+                                if state.request_emitted && state.response_emitted {
+                                    self.streams.remove(&key);
+                                }
+                                continue;
+                            }
                             if state.response_body.len().saturating_add(payload.len())
                                 > MAX_HTTP_BODY_BYTES
                             {
@@ -2259,7 +2445,7 @@ fn create_http2_response_event(
     let body = body_string(&state.response_body);
     let body_hex = (!state.response_body.is_empty()).then(|| hex::encode(&state.response_body));
     let total_size = headers_size(&state.response_headers) + state.response_body.len();
-    HTTPEvent {
+    let mut output = HTTPEvent {
         capture_metadata: state.response_capture_metadata.capture.finish(),
         tid,
         connection_id: Some(connection.id.clone()),
@@ -2298,7 +2484,11 @@ fn create_http2_response_event(
         raw_data: include_raw_data
             .then(|| String::from_utf8_lossy(&state.response_body).to_string()),
     }
-    .to_event(original_event)
+    .to_event(original_event);
+    if connection.exact && is_uncompressed_sse(&state.response_headers) {
+        set_response_chunk(&mut output, &state.response_body, true, include_raw_data);
+    }
+    output
 }
 
 fn http2_terminal_event(
