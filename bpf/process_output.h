@@ -12,6 +12,7 @@
 typedef void (*as_output_fn)(void *, int, const char *, size_t);
 static as_output_fn as_output_sink;
 static void *as_output_context;
+static const char *as_procfs_root = "/proc";
 static char as_output_buffer[65536];
 static size_t as_output_length;
 static bool as_output_truncated;

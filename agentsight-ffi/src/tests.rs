@@ -150,6 +150,8 @@ fn byte_limit_and_truncated_serialization_are_counted() {
         assert_eq!(d.stats.output_dropped_records, 1);
         assert_eq!(d.stats.aggregate_overflow, 4);
         drop(d);
+        receive(s, 0, br#"{"event":"ENHANCEMENT_RING_LOST","count":7}"#);
+        assert_eq!(lock(&s.data).stats.kernel_ring_dropped, 7);
         agentsight_free(h);
     }
 }
@@ -162,23 +164,57 @@ fn config_size_and_copy() {
         assert_eq!(agentsight_set_config(h, &c), -libc::EINVAL);
         c.struct_size = size_of::<AgentsightConfig>() as u32;
         c.abi_version = 1;
-        c.target_pid = 1;
+        assert_eq!(agentsight_set_config(h, &c), -libc::EINVAL);
+        c.abi_version = AGENTSIGHT_ABI_VERSION;
+        c.discovery_interval_ms = 1;
+        assert_eq!(agentsight_set_config(h, &c), -libc::EINVAL);
+        c.discovery_interval_ms = 0;
         let path = CString::new("/not/real.so").unwrap();
-        c.marker_path = path.as_ptr();
-        c.asyncio_path = path.as_ptr();
-        c.python_path = path.as_ptr();
-        c.task_step_offset = 1;
-        c.task_init_offset = 2;
-        c.context_copy_offset = 3;
-        c.context_run_offset = 4;
+        c.procfs_root = path.as_ptr();
         assert_eq!(agentsight_set_config(h, &c), 0);
         drop(path);
         assert_eq!(
-            lock(&(*h).lifecycle).config.as_ref().unwrap().paths[0]
+            lock(&(*h).lifecycle)
+                .config
+                .as_ref()
+                .unwrap()
+                .procfs_root
                 .to_str()
                 .unwrap(),
             "/not/real.so"
         );
         agentsight_free(h);
+    }
+}
+
+#[test]
+fn discovery_start_is_nonblocking_and_stop_interrupts_wait() {
+    unsafe {
+        let h = handle();
+        let root = CString::new("/nonexistent-agentsight-unit-proc").unwrap();
+        let mut cfg: AgentsightConfig = std::mem::zeroed();
+        cfg.struct_size = size_of::<AgentsightConfig>() as u32;
+        cfg.abi_version = AGENTSIGHT_ABI_VERSION;
+        cfg.procfs_root = root.as_ptr();
+        cfg.discovery_interval_ms = 60000;
+        assert_eq!(agentsight_set_config(h, &cfg), 0);
+        let start = std::time::Instant::now();
+        assert_eq!(agentsight_start(h), 0);
+        assert!(start.elapsed().as_secs() < 2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let mut stats = AgentsightStats::default();
+            agentsight_get_stats(h, &mut stats, size_of::<AgentsightStats>());
+            assert_eq!(stats.state, AGENTSIGHT_STATE_RUNNING);
+            if stats.target_state == AGENTSIGHT_TARGET_DEGRADED {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let stop = std::time::Instant::now();
+        assert_eq!(agentsight_stop(h), 0);
+        assert!(stop.elapsed().as_secs() < 2);
+        assert_eq!(agentsight_free(h), 0);
     }
 }

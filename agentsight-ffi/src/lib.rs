@@ -15,7 +15,10 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-pub const AGENTSIGHT_ABI_VERSION: u32 = 1;
+mod discovery;
+mod supervisor;
+
+pub const AGENTSIGHT_ABI_VERSION: u32 = 2;
 pub const AGENTSIGHT_EVENT_FILE_OPEN: u32 = 1;
 pub const AGENTSIGHT_EVENT_FILE_WRITE: u32 = 2;
 pub const AGENTSIGHT_EVENT_FILE_RENAME: u32 = 3;
@@ -25,10 +28,19 @@ pub const AGENTSIGHT_STATE_CONFIGURED: u32 = 1;
 pub const AGENTSIGHT_STATE_RUNNING: u32 = 2;
 pub const AGENTSIGHT_STATE_STOPPED: u32 = 3;
 pub const AGENTSIGHT_STATE_FAILED: u32 = 4;
-/// Ring-buffer drops and all correlation-map failures are NOT measured in v1.
+pub const AGENTSIGHT_TARGET_IDLE: u32 = 0;
+pub const AGENTSIGHT_TARGET_WAITING: u32 = 1;
+pub const AGENTSIGHT_TARGET_ATTACHING: u32 = 2;
+pub const AGENTSIGHT_TARGET_READY: u32 = 3;
+pub const AGENTSIGHT_TARGET_DEGRADED: u32 = 4;
+pub const AGENTSIGHT_ADAPT_SYMBOLS: u32 = 1;
+pub const AGENTSIGHT_ADAPT_BUILD_ID: u32 = 2;
+/// User queue accounting; correlation-map failures are not fully measured.
 pub const AGENTSIGHT_STATS_USER_QUEUE: u32 = 1;
 /// Existing aggregation-map overflow counter, best effort (not total kernel loss).
 pub const AGENTSIGHT_STATS_AGG_OVERFLOW: u32 = 2;
+/// Failed ring reservations in enhancement open/rename/exec/exit probes.
+pub const AGENTSIGHT_STATS_KERNEL_RING: u32 = 4;
 
 /// Zero-initialize, then set struct_size, abi_version and required fields.
 /// Strings are borrowed for set_config only; the library copies them.
@@ -36,24 +48,15 @@ pub const AGENTSIGHT_STATS_AGG_OVERFLOW: u32 = 2;
 pub struct AgentsightConfig {
     pub struct_size: u32,
     pub abi_version: u32,
-    /// Host-visible PID, or zero to select a cgroup instead. No implicit trace-all.
-    pub target_pid: i32,
-    pub include_cgroup_children: u32,
     /// Zero selects 1024 events. Maximum 65536.
     pub queue_capacity: u32,
-    pub reserved: u32,
+    /// Zero selects 1000 ms. Supported range: 100..60000 ms.
+    pub discovery_interval_ms: u32,
     /// Zero selects 16 MiB. Bounds queued payload + event metadata, not all RSS.
     pub max_queue_bytes: u64,
-    pub marker_path: *const c_char,
-    pub asyncio_path: *const c_char,
-    pub python_path: *const c_char,
-    /// Optional absolute cgroup v2 path visible to the host process.
-    pub cgroup_path: *const c_char,
-    /// Explicit validated ELF file offsets; no universal CPython defaults.
-    pub task_step_offset: u64,
-    pub task_init_offset: u64,
-    pub context_copy_offset: u64,
-    pub context_run_offset: u64,
+    /// NULL/empty selects /proc. Requires the host PID namespace, not merely a
+    /// host procfs bind mount. No implicit command-name or time-window matching.
+    pub procfs_root: *const c_char,
 }
 
 /// Immutable owned event. Release exactly once with agentsight_free_event.
@@ -101,6 +104,22 @@ pub struct AgentsightStats {
     pub aggregate_overflow: u64,
     pub queued_events: u64,
     pub queued_bytes: u64,
+    /// RUNNING does not imply READY. Inspect this field before claiming capture.
+    pub target_state: u32,
+    pub target_pid: i32,
+    /// /proc/PID/stat starttime, in clock ticks, not nanoseconds.
+    pub target_start_ticks: u64,
+    pub target_generation: u64,
+    pub discovery_scans: u64,
+    pub discovery_errors: u64,
+    pub attach_attempts: u64,
+    pub attach_failures: u64,
+    pub target_detaches: u64,
+    /// Negative errno for the current discovery/attachment failure, or zero.
+    pub target_error: i32,
+    /// Zero until READY, then AGENTSIGHT_ADAPT_*.
+    pub adaptation_method: u32,
+    pub kernel_ring_dropped: u64,
 }
 
 #[repr(C)]
@@ -115,6 +134,8 @@ struct CoreConfig {
     task_init_offset: u64,
     context_copy_offset: u64,
     context_run_offset: u64,
+    symbol_mask: u32,
+    procfs_root: *const c_char,
 }
 unsafe extern "C" {
     fn as_core_open(
@@ -124,16 +145,15 @@ unsafe extern "C" {
     ) -> i32;
     fn as_core_poll(timeout_ms: i32, wake_fd: i32) -> i32;
     fn as_core_close();
+    fn as_core_target_changed() -> i32;
 }
 
 #[derive(Clone)]
 struct Config {
-    pid: i32,
-    children: u32,
     capacity: usize,
     bytes: usize,
-    paths: [CString; 4],
-    offsets: [u64; 4],
+    procfs_root: CString,
+    interval_ms: u32,
 }
 
 #[repr(C)]
@@ -288,40 +308,22 @@ unsafe fn config_from_abi(c: *const AgentsightConfig) -> Result<Config, (i32, St
         return Err(error(libc::EINVAL, "config struct_size mismatch"));
     }
     let c = unsafe { &*c };
-    if c.abi_version != AGENTSIGHT_ABI_VERSION
-        || c.reserved != 0
-        || c.target_pid < 0
-        || c.include_cgroup_children > 1
-    {
-        return Err(error(
-            libc::EINVAL,
-            "invalid ABI version, reserved field or target",
-        ));
+    if c.abi_version != AGENTSIGHT_ABI_VERSION {
+        return Err(error(libc::EINVAL, "invalid ABI version"));
     }
-    let paths = unsafe {
-        [
-            copy_path(c.marker_path, true, 4096)?,
-            copy_path(c.asyncio_path, true, 4096)?,
-            copy_path(c.python_path, true, 4096)?,
-            copy_path(c.cgroup_path, false, 256)?,
-        ]
+    let mut procfs_root = unsafe { copy_path(c.procfs_root, false, 4096)? };
+    if procfs_root.is_empty() {
+        procfs_root = CString::new("/proc").unwrap();
+    }
+    let interval_ms = if c.discovery_interval_ms == 0 {
+        1000
+    } else {
+        c.discovery_interval_ms
     };
-    if (c.target_pid == 0 || c.include_cgroup_children != 0) && paths[3].is_empty() {
+    if !(100..=60000).contains(&interval_ms) {
         return Err(error(
             libc::EINVAL,
-            "a target PID or cgroup is required; children requires cgroup",
-        ));
-    }
-    let offsets = [
-        c.task_step_offset,
-        c.task_init_offset,
-        c.context_copy_offset,
-        c.context_run_offset,
-    ];
-    if offsets.contains(&0) {
-        return Err(error(
-            libc::EINVAL,
-            "all four validated CPython offsets are required",
+            "discovery interval outside 100..60000 ms",
         ));
     }
     let capacity = if c.queue_capacity == 0 {
@@ -338,12 +340,10 @@ unsafe fn config_from_abi(c: *const AgentsightConfig) -> Result<Config, (i32, St
         return Err(error(libc::EINVAL, "queue limit outside supported range"));
     }
     Ok(Config {
-        pid: c.target_pid,
-        children: c.include_cgroup_children,
         capacity,
         bytes: bytes as usize,
-        paths,
-        offsets,
+        procfs_root,
+        interval_ms,
     })
 }
 
@@ -400,6 +400,10 @@ fn receive(shared: &Shared, kind: i32, bytes: &[u8]) {
     }
     if v["type"] == "AGG_MAP_OVERFLOW" {
         d.stats.aggregate_overflow += v["overflow_count"].as_u64().unwrap_or(0);
+        return;
+    }
+    if name == "ENHANCEMENT_RING_LOST" {
+        d.stats.kernel_ring_dropped += v["count"].as_u64().unwrap_or(0);
         return;
     }
     let event_type = match name {
@@ -498,36 +502,7 @@ unsafe extern "C" fn core_output(context: *mut c_void, kind: i32, data: *const c
 }
 
 fn worker(s: Arc<Shared>, cfg: Config, ready: mpsc::SyncSender<i32>, _reservation: Reservation) {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let _core = CoreGuard;
-        let raw = CoreConfig {
-            pid: cfg.pid,
-            cgroup_children: cfg.children,
-            marker_path: cfg.paths[0].as_ptr(),
-            asyncio_path: cfg.paths[1].as_ptr(),
-            python_path: cfg.paths[2].as_ptr(),
-            cgroup_path: cfg.paths[3].as_ptr(),
-            task_step_offset: cfg.offsets[0],
-            task_init_offset: cfg.offsets[1],
-            context_copy_offset: cfg.offsets[2],
-            context_run_offset: cfg.offsets[3],
-        };
-        let rc = unsafe { as_core_open(&raw, core_output, Arc::as_ptr(&s) as *mut c_void) };
-        if rc != 0 {
-            return rc;
-        }
-        s.state.store(AGENTSIGHT_STATE_RUNNING, Ordering::Release);
-        if ready.send(0).is_err() {
-            return -libc::ECANCELED;
-        }
-        while !s.stop.load(Ordering::Acquire) {
-            let rc = unsafe { as_core_poll(250, s.wake.as_raw_fd()) };
-            if rc < 0 {
-                return rc;
-            }
-        }
-        0
-    }));
+    let result = catch_unwind(AssertUnwindSafe(|| supervisor::run(&s, &cfg, &ready)));
     let rc = result.unwrap_or(-libc::EFAULT);
     if rc != 0 {
         let mut d = lock(&s.data);
@@ -643,7 +618,8 @@ pub unsafe extern "C" fn agentsight_set_config(
     }
 }
 
-/// Starts one in-process worker. Success means BPF/probes/ring-buffer are ready.
+/// Starts the discovery worker, even if Jiuwen is absent. Success is NOT target readiness.
+/// Inspect get_stats.target_state; unknown runtimes degrade without stopping discovery.
 /// Idempotent while running. After stop, drain events before restarting.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn agentsight_start(h: *mut AgentsightHandle) -> i32 {
@@ -817,8 +793,9 @@ pub unsafe extern "C" fn agentsight_get_stats(
             snapshot.struct_size = size_of::<AgentsightStats>() as u32;
             snapshot.abi_version = AGENTSIGHT_ABI_VERSION;
             snapshot.state = h.shared.state.load(Ordering::Acquire);
-            snapshot.supported_counters =
-                AGENTSIGHT_STATS_USER_QUEUE | AGENTSIGHT_STATS_AGG_OVERFLOW;
+            snapshot.supported_counters = AGENTSIGHT_STATS_USER_QUEUE
+                | AGENTSIGHT_STATS_AGG_OVERFLOW
+                | AGENTSIGHT_STATS_KERNEL_RING;
             snapshot.queued_events = d.queue.len() as u64;
             snapshot.queued_bytes = d.bytes as u64;
             stats.write(snapshot);

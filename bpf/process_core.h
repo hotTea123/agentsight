@@ -17,9 +17,12 @@ struct as_core_config {
 	uint64_t task_init_offset;
 	uint64_t context_copy_offset;
 	uint64_t context_run_offset;
+	uint32_t symbol_mask;
+	const char *procfs_root;
 };
 typedef void (*as_core_output_fn)(void *, int, const char *, size_t);
 int as_core_open(const struct as_core_config *, as_core_output_fn, void *);
 int as_core_poll(int timeout_ms, int wake_fd);
 void as_core_close(void);
+int as_core_target_changed(void);
 #endif

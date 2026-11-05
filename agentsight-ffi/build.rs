@@ -17,6 +17,8 @@ fn main() {
         "process.h",
         "process_core.h",
         "process_output.h",
+        "python_runtime.c",
+        "python_runtime.h",
         "process.bpf.c",
         "process_ext",
         "container_info.h",

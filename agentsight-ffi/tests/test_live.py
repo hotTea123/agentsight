@@ -32,7 +32,7 @@ async def worker(args):
     exporter = InMemorySpanExporter()
     init_observability(ObservabilityConfig(
         service_name="agentsight-ffi-acceptance", backend="otlp",
-        agentsight_tool_enhancement_enabled=args.mode == "on",
+        agentsight_tool_enhancement_enabled=args.mode != "off",
         agentsight_marker_library=str(args.marker),
     ), span_exporter_override=exporter)
     sync_agent_observability()
@@ -128,29 +128,41 @@ def wait_until(predicate, processes, timeout=45):
     raise AssertionError("timed out waiting for readiness or formal tool completion")
 
 
-def run(args, mode):
-    work = args.workdir / mode
+def run(args, mode, host_first=False):
+    work = args.workdir / (mode + ("-host-first" if host_first else "-app-first"))
     work.mkdir()
     (work / "config").mkdir()
     (work / "input.txt").write_text("real span-enhancement FFI acceptance\n")
     save(work / "config/config.yaml", {
-        "agent_observability": {"enabled": True, "service_name": "agentsight-ffi-acceptance", "agentsight_tool_enhancement_enabled": mode == "on", "agentsight_marker_library": str(args.marker)},
+        "agent_observability": {"enabled": True, "service_name": "agentsight-ffi-acceptance", "agentsight_tool_enhancement_enabled": mode != "off", "agentsight_marker_library": str(args.marker)},
         "react": {"evolution": {"skill_evolution": False}},
     })
     env = os.environ | {
         "PYTHONDONTWRITEBYTECODE": "1",
         "JIUWENSWARM_DATA_DIR": str(work), "JIUWENSWARM_CONFIG_DIR": str(work / "config"),
     }
+    if mode == "unsupported":
+        env["PYTHONPATH"] = str(args.unsupported_asyncio) + os.pathsep + env.get("PYTHONPATH", "")
     app = host = None
     try:
         with (work / "python.log").open("w") as pylog, (work / "capture.jsonl").open("w") as capture, (work / "capture.stderr").open("w") as errlog:
+            if host_first:
+                host = subprocess.Popen([str(args.capture)], stdin=subprocess.PIPE, stdout=capture, stderr=errlog)
+                wait_until(lambda: "STARTED" in (work / "capture.jsonl").read_text(), [host])
+                time.sleep(0.3)
+                assert "READY" not in (work / "capture.jsonl").read_text()
             app = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--worker", "--workdir", str(work), "--mode", mode, "--marker", str(args.marker)], env=env, cwd=work, stdout=pylog, stderr=subprocess.STDOUT)
             # Wait for actual marker mapping (on) or Python imports/provider (off).
-            if mode == "on":
+            if mode != "off":
                 wait_until(lambda: str(args.marker) in Path(f"/proc/{app.pid}/maps").read_text(), [app])
-            host = subprocess.Popen([str(args.capture), str(app.pid), str(args.marker), str(args.asyncio_lib), str(args.python_lib), *[str(x) for x in args.offsets]], stdin=subprocess.PIPE, stdout=capture, stderr=errlog)
+            if host is None:
+                host = subprocess.Popen([str(args.capture)], stdin=subprocess.PIPE, stdout=capture, stderr=errlog)
             for round_id in range(2):
-                wait_until(lambda: (work / "capture.jsonl").read_text().count("READY") >= round_id + 1, [app, host])
+                readiness = "READY" if mode == "on" else "STARTED"
+                wait_until(lambda: (work / "capture.jsonl").read_text().count(readiness) >= round_id + 1, [app, host])
+                if mode == "unsupported":
+                    wait_until(lambda: (work / "capture.jsonl").read_text().count("DIAGNOSTIC") >= round_id + 1, [app, host])
+                    assert "no verified Build ID profile" in (work / "capture.jsonl").read_text()
                 # The C test host must only have threads, never a collector child.
                 children = [p.read_text().strip() for p in Path(f"/proc/{host.pid}/task").glob("*/children")]
                 assert not any(children), children
@@ -178,7 +190,7 @@ def run(args, mode):
     lines = [json.loads(line) for line in (work / "capture.jsonl").read_text().splitlines() if line.startswith("{")]
     events = [e for e in lines if "payload" in e]
     stats = next(e["stats"] for e in lines if "stats" in e)
-    assert stats["invalid"] == stats["backend_errors"] == stats["dropped"] == 0, stats
+    assert stats["invalid"] == stats["backend_errors"] == stats["dropped"] == stats["kernel_ring_dropped"] == 0, stats
     assert not (work / "capture.stderr").read_text(), "library wrote to stderr"
     sources = set()
     by_span = {}
@@ -193,6 +205,9 @@ def run(args, mode):
         by_span.setdefault(key, []).append(payload)
         sources.add(payload["agentsight_correlation_source"])
     if mode == "on":
+        ready = [e for e in lines if e.get("target_state") == 3]
+        assert ready and all(e["target_pid"] == app.pid for e in ready), ready
+        assert all(e["adaptation"] in (1, 2) for e in ready), ready
         for e in expected:
             records = by_span.get((e["trace_id"], e["span_id"]), [])
             kinds = {r["event"] for r in records}
@@ -203,7 +218,8 @@ def run(args, mode):
         assert {"task", "task_parent", "py_context", "process"} <= sources, sources
     else:
         assert events == [], events
-    return dict(mode=mode, passed=True, tool_spans=len(formal), events=len(events), sources=sorted(sources), stats=stats)
+        assert "READY" not in (work / "capture.jsonl").read_text()
+    return dict(mode=mode, host_first=host_first, passed=True, tool_spans=len(formal), events=len(events), sources=sorted(sources), stats=stats)
 
 
 if __name__ == "__main__":
@@ -213,14 +229,14 @@ if __name__ == "__main__":
     p.add_argument("--worker", action="store_true")
     p.add_argument("--mode", default="on")
     p.add_argument("--capture", type=Path)
-    p.add_argument("--asyncio-lib", type=Path)
-    p.add_argument("--python-lib", type=Path)
-    p.add_argument("--offsets", nargs=4, type=int)
+    p.add_argument("--unsupported-asyncio", type=Path)
     args = p.parse_args()
     if args.worker:
         asyncio.run(worker(args))
     else:
         args.workdir.mkdir(parents=True, exist_ok=False)
-        result = [run(args, mode) for mode in ("on", "off")]
+        result = [run(args, "on"), run(args, "on", host_first=True), run(args, "off", host_first=True)]
+        if args.unsupported_asyncio:
+            result.append(run(args, "unsupported", host_first=True))
         save(args.workdir / "verification.json", result)
         print(json.dumps(result, indent=2))

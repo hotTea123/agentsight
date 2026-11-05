@@ -91,6 +91,7 @@ static struct env {
 	unsigned long long python_task_init_offset;
 	unsigned long long python_context_copy_offset;
 	unsigned long long python_context_run_offset;
+	unsigned python_symbol_mask;
 	char cgroup_filter_path[256];
 	bool cgroup_filter_enabled;
 	bool cgroup_filter_children;
@@ -525,9 +526,10 @@ static void report_file_open_drops(void)
 			struct timespec now = {};
 			clock_gettime(CLOCK_BOOTTIME, &now);
 			uint64_t timestamp_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
-			as_output_printf("{\"timestamp\":%llu,\"event\":\"FILE_OPEN_LOST\","
+			as_output_printf("{\"timestamp\":%llu,\"event\":\"%s\","
 			       "\"pid\":0,\"comm\":\"process\",\"count\":%llu}\n",
 				(unsigned long long)timestamp_ns,
+				env.trace_python_async_context ? "ENHANCEMENT_RING_LOST" : "FILE_OPEN_LOST",
 				(unsigned long long)(total - g_file_open_drops_reported));
 			as_output_flush();
 			g_file_open_drops_reported = total;
@@ -632,6 +634,8 @@ static void configure_process_skel(struct process_bpf *skel, bool resolved_opens
 				   uint64_t cgroup_filter_id)
 {
 	configure_optional_programs(skel);
+	if (env.trace_python_async_context)
+		bpf_program__set_autoload(skel->progs.bash_readline, false);
 	bpf_program__set_autoload(skel->progs.trace_file_open_exit, resolved_opens);
 	bpf_program__set_autoload(skel->progs.trace_openat, !resolved_opens);
 #if !defined(__aarch64__)
@@ -650,6 +654,7 @@ static void configure_process_skel(struct process_bpf *skel, bool resolved_opens
 	skel->rodata->target_pidns_dev = env.pidns_dev;
 	skel->rodata->target_pidns_ino = env.pidns_ino;
 	skel->rodata->trace_python_async_context = env.trace_python_async_context;
+	skel->rodata->python_target_pid = env.pid > 0 ? env.pid : 0;
 }
 
 static int attach_python_async_uprobes(struct process_bpf *skel)
@@ -657,9 +662,12 @@ static int attach_python_async_uprobes(struct process_bpf *skel)
 	pid_t attach_pid = env.pid > 0 ? env.pid : -1;
 	long link_error;
 
-#define ATTACH_PYTHON_UPROBE(link_name, program_name, retprobe, path, offset) do { \
-		skel->links.link_name = bpf_program__attach_uprobe( \
-			skel->progs.program_name, retprobe, attach_pid, path, offset); \
+#define ATTACH_PYTHON_UPROBE(link_name, program_name, is_return, path, offset, bit, symbol) do { \
+		LIBBPF_OPTS(bpf_uprobe_opts, opts, .retprobe = is_return, \
+			.func_name = (env.python_symbol_mask & (bit)) ? symbol : NULL); \
+		skel->links.link_name = bpf_program__attach_uprobe_opts( \
+			skel->progs.program_name, attach_pid, path, \
+			(env.python_symbol_mask & (bit)) ? 0 : offset, &opts); \
 		link_error = libbpf_get_error(skel->links.link_name); \
 		if (link_error) { \
 			skel->links.link_name = NULL; \
@@ -671,25 +679,25 @@ static int attach_python_async_uprobes(struct process_bpf *skel)
 
 	ATTACH_PYTHON_UPROBE(
 		python_task_step_enter, python_task_step_enter, false,
-		env.python_asyncio_path, env.python_task_step_offset);
+		env.python_asyncio_path, env.python_task_step_offset, 1, "task_step_impl");
 	ATTACH_PYTHON_UPROBE(
 		python_task_step_exit, python_task_step_exit, true,
-		env.python_asyncio_path, env.python_task_step_offset);
+		env.python_asyncio_path, env.python_task_step_offset, 1, "task_step_impl");
 	ATTACH_PYTHON_UPROBE(
 		python_task_init_enter, python_task_init_enter, false,
-		env.python_asyncio_path, env.python_task_init_offset);
+		env.python_asyncio_path, env.python_task_init_offset, 2, "_asyncio_Task___init__");
 	ATTACH_PYTHON_UPROBE(
 		python_copy_context_enter, python_copy_context_enter, false,
-		env.python_runtime_path, env.python_context_copy_offset);
+		env.python_runtime_path, env.python_context_copy_offset, 4, "PyContext_CopyCurrent");
 	ATTACH_PYTHON_UPROBE(
 		python_copy_context_exit, python_copy_context_exit, true,
-		env.python_runtime_path, env.python_context_copy_offset);
+		env.python_runtime_path, env.python_context_copy_offset, 4, "PyContext_CopyCurrent");
 	ATTACH_PYTHON_UPROBE(
 		python_context_run_enter, python_context_run_enter, false,
-		env.python_runtime_path, env.python_context_run_offset);
+		env.python_runtime_path, env.python_context_run_offset, 8, "context_run");
 	ATTACH_PYTHON_UPROBE(
 		python_context_run_exit, python_context_run_exit, true,
-		env.python_runtime_path, env.python_context_run_offset);
+		env.python_runtime_path, env.python_context_run_offset, 8, "context_run");
 
 #undef ATTACH_PYTHON_UPROBE
 
@@ -1398,7 +1406,7 @@ static int core_load(void)
 	g_tracked_cgroups_fd = bpf_map__fd(skel->maps.tracked_cgroups);
 	g_overflow_fd = bpf_map__fd(skel->maps.agg_overflow_count);
 	g_exit_mem_fd = bpf_map__fd(skel->maps.exit_mem);
-	g_file_open_dropped_fd = resolved_opens ?
+	g_file_open_dropped_fd = (resolved_opens || env.trace_python_async_context) ?
 		bpf_map__fd(skel->maps.file_open_dropped) : -1;
 	g_file_open_prog_fd = resolved_opens ?
 		bpf_program__fd(skel->progs.trace_file_open_exit) : -1;
@@ -1540,10 +1548,14 @@ int as_core_open(const struct as_core_config *cfg, as_core_output_fn output, voi
 	if (!cfg || !output || active_skel)
 		return -EINVAL;
 	if (!cfg->marker_path || !cfg->asyncio_path || !cfg->python_path ||
-	    cfg->pid < 0 || !cfg->task_step_offset || !cfg->task_init_offset ||
-	    !cfg->context_copy_offset || !cfg->context_run_offset)
+	    cfg->pid < 0 || (cfg->symbol_mask & ~15U) ||
+	    (!(cfg->symbol_mask & 1) && !cfg->task_step_offset) ||
+	    (!(cfg->symbol_mask & 2) && !cfg->task_init_offset) ||
+	    (!(cfg->symbol_mask & 4) && !cfg->context_copy_offset) ||
+	    (!(cfg->symbol_mask & 8) && !cfg->context_run_offset))
 		return -EINVAL;
 	memset(&env, 0, sizeof(env));
+	as_procfs_root = cfg->procfs_root ? cfg->procfs_root : "/proc";
 	as_output_set_sink(output, context);
 	/* libbpf is statically linked with hidden symbols, not the host's instance.
 	 * Never change the host's resource limits or signal handlers. */
@@ -1582,6 +1594,7 @@ int as_core_open(const struct as_core_config *cfg, as_core_output_fn output, voi
 	env.python_task_init_offset = cfg->task_init_offset;
 	env.python_context_copy_offset = cfg->context_copy_offset;
 	env.python_context_run_offset = cfg->context_run_offset;
+	env.python_symbol_mask = cfg->symbol_mask;
 	return core_load();
 }
 
@@ -1590,10 +1603,21 @@ int as_core_poll(int timeout_ms, int wake_fd)
 	return active_rb ? core_poll(timeout_ms, wake_fd) : -EINVAL;
 }
 
+int as_core_target_changed(void)
+{
+	uint32_t zero = 0, changed = 0;
+	if (!active_skel)
+		return -EINVAL;
+	if (bpf_map_lookup_elem(bpf_map__fd(active_skel->maps.python_target_changed), &zero, &changed) < 0)
+		return -errno;
+	return changed ? 1 : 0;
+}
+
 void as_core_close(void)
 {
 	core_close();
 	as_output_set_sink(NULL, NULL);
+	as_procfs_root = "/proc";
 }
 #else
 int main(int argc, char **argv)

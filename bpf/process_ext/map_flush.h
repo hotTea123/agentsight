@@ -9,6 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <limits.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "process_ext/types.h"
@@ -84,10 +85,10 @@ static bool parse_fd_detail(const char *detail, int *fd_out)
 
 static bool resolve_fd_path(uint32_t pid, int fd, char *out, size_t out_size)
 {
-	char fd_link[64];
+	char fd_link[PATH_MAX];
 	char link_target[MAX_FILENAME_LEN];
 
-	snprintf(fd_link, sizeof(fd_link), "/proc/%u/fd/%d", pid, fd);
+	snprintf(fd_link, sizeof(fd_link), "%s/%u/fd/%d", as_procfs_root, pid, fd);
 	ssize_t n = readlink(fd_link, link_target, sizeof(link_target) - 1);
 	if (n <= 0)
 		return false;

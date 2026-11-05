@@ -116,6 +116,7 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	struct event *e;
 	pid_t pid;
 	u64 ts;
+	invalidate_python_target(bpf_get_current_pid_tgid() >> 32);
 
 	if (!is_scope_tracked())
 		return 0;
@@ -123,6 +124,8 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	/* Get process info */
 	pid = bpf_get_current_pid_tgid() >> 32;
 	task = (struct task_struct *)bpf_get_current_task();
+	if (trace_python_async_context && !is_pid_tracked() && !has_python_tool_context())
+		return 0;
 
 	/* remember time exec() was executed for this PID */
 	ts = bpf_ktime_get_ns();
@@ -134,8 +137,10 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 
 	/* reserve sample from BPF ringbuf */
 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		count_python_ring_drop();
 		return 0;
+	}
 
 	/* fill out the sample with data */
 	e->type = EVENT_TYPE_PROCESS;
@@ -207,6 +212,24 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 	pid_t pid, tid;
 	u64 id, ts, *start_ts, duration_ns = 0;
 
+	id = bpf_get_current_pid_tgid();
+	pid = id >> 32;
+	tid = (u32)id;
+	bool had_context = trace_python_async_context &&
+		bpf_map_lookup_elem(&python_process_spans, &pid) != NULL;
+	if (trace_python_async_context) {
+		bpf_map_delete_elem(&python_current_tasks, &id);
+		bpf_map_delete_elem(&python_copy_context_sources, &id);
+		bpf_map_delete_elem(&python_context_run_previous, &id);
+		bpf_map_delete_elem(&pending_file_opens, &id);
+		bpf_map_delete_elem(&pending_file_dups, &id);
+		bpf_map_delete_elem(&write_ctx_map, &id);
+		if (pid == tid) {
+			invalidate_python_target(pid);
+			bpf_map_delete_elem(&python_process_spans, &pid);
+		}
+	}
+
 	if (!is_scope_tracked())
 		return 0;
 
@@ -220,6 +243,8 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 
 	/* ignore thread exits */
 	if (pid != tid)
+		return 0;
+	if (trace_python_async_context && !is_pid_tracked() && !had_context)
 		return 0;
 
 	/* if we recorded start of the process, calculate lifetime duration */
@@ -237,8 +262,10 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 
 	/* reserve sample from BPF ringbuf */
 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		count_python_ring_drop();
 		return 0;
+	}
 
 	/* fill out the sample with data */
 	task = (struct task_struct *)bpf_get_current_task();
@@ -279,6 +306,10 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
 
 	if (!is_scope_tracked())
 		return 0;
+	/* Discovery reads many proc files. Do not let unrelated opens consume
+	 * the enhancement ring buffer before userspace applies its PID filter. */
+	if (trace_python_async_context && !is_pid_tracked() && !has_python_tool_context())
+		return 0;
 
 	pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -287,6 +318,8 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
 	filename = (const char *)ctx->args[1];
 	flags = (int)ctx->args[2];
 	track_file_open_enter(filename, flags);
+	if (trace_python_async_context && !has_python_tool_context())
+		return 0; /* Keep FD tracking, but only enqueue attributable opens. */
 
 	/* Read filename from user space */
 	if (bpf_probe_read_user_str(filepath, sizeof(filepath), filename) < 0)
@@ -294,8 +327,10 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
 
 	/* Reserve sample from BPF ringbuf */
 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		count_python_ring_drop();
 		return 0;
+	}
 
 	/* Fill out the event */
 	e->type = EVENT_TYPE_FILE_OPERATION;
@@ -332,6 +367,8 @@ int trace_open(struct trace_event_raw_sys_enter *ctx)
 
 	if (!is_scope_tracked())
 		return 0;
+	if (trace_python_async_context && !is_pid_tracked() && !has_python_tool_context())
+		return 0;
 
 	pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -339,6 +376,8 @@ int trace_open(struct trace_event_raw_sys_enter *ctx)
 	filename = (const char *)ctx->args[0];
 	flags = (int)ctx->args[1];
 	track_file_open_enter(filename, flags);
+	if (trace_python_async_context && !has_python_tool_context())
+		return 0;
 
 	/* Read filename from user space */
 	if (bpf_probe_read_user_str(filepath, sizeof(filepath), filename) < 0)
@@ -346,8 +385,10 @@ int trace_open(struct trace_event_raw_sys_enter *ctx)
 
 	/* Reserve sample from BPF ringbuf */
 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		count_python_ring_drop();
 		return 0;
+	}
 
 	/* Fill out the event */
 	e->type = EVENT_TYPE_FILE_OPERATION;

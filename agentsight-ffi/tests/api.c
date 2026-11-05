@@ -25,7 +25,9 @@ int main(int argc, char **argv)
         assert(dlsym(library, symbols[i]));
     assert(!dlsym(library, "agentsight_suspend"));
     assert(!dlsym(library, "bpf_object__open"));
-    assert(agentsight_abi_version() == 1);
+    assert(!dlsym(library, "as_core_target_changed"));
+    assert(!dlsym(library, "as_inspect_elf"));
+    assert(agentsight_abi_version() == AGENTSIGHT_ABI_VERSION);
     struct sigaction before, after;
     struct rlimit limit_before, limit_after;
     assert(sigaction(SIGINT, NULL, &before) == 0);
@@ -43,16 +45,18 @@ int main(int argc, char **argv)
         AgentsightConfig cfg = {0};
         cfg.struct_size = sizeof(cfg);
         cfg.abi_version = AGENTSIGHT_ABI_VERSION;
-        cfg.target_pid = getpid();
-        cfg.marker_path = "/nonexistent-agentsight-test/marker.so";
-        cfg.asyncio_path = cfg.marker_path;
-        cfg.python_path = cfg.marker_path;
-        cfg.task_step_offset = cfg.task_init_offset = cfg.context_copy_offset = cfg.context_run_offset = 1;
+        cfg.procfs_root = "/nonexistent-agentsight-test/proc";
+        cfg.discovery_interval_ms = 100;
         assert(agentsight_set_config(h, &cfg) == 0);
-        assert(agentsight_start(h) < 0);
+        assert(agentsight_start(h) == 0);
         AgentsightStats stats;
-        assert(agentsight_get_stats(h, &stats, sizeof(stats)) == 0);
-        assert(stats.state == AGENTSIGHT_STATE_FAILED && stats.backend_errors == 1);
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            assert(agentsight_get_stats(h, &stats, sizeof(stats)) == 0);
+            if (stats.target_state == AGENTSIGHT_TARGET_DEGRADED) break;
+            usleep(10000);
+        }
+        assert(stats.state == AGENTSIGHT_STATE_RUNNING && stats.target_state == AGENTSIGHT_TARGET_DEGRADED);
+        assert(stats.discovery_errors > 0 && stats.attach_attempts == 0);
         assert(agentsight_stop(h) == 0);
         pid_t child = fork();
         assert(child >= 0);

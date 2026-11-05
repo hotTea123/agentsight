@@ -1,4 +1,4 @@
-/* AgentSight tool-span evidence ABI v1. See README.md for ownership and threading rules. */
+/* AgentSight tool-span evidence ABI v2. See README.md for ownership and threading rules. */
 
 #ifndef AGENTSIGHT_H
 #define AGENTSIGHT_H
@@ -11,7 +11,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define AGENTSIGHT_ABI_VERSION 1
+#define AGENTSIGHT_ABI_VERSION 2
 
 #define AGENTSIGHT_EVENT_FILE_OPEN 1
 
@@ -31,8 +31,22 @@
 
 #define AGENTSIGHT_STATE_FAILED 4
 
+#define AGENTSIGHT_TARGET_IDLE 0
+
+#define AGENTSIGHT_TARGET_WAITING 1
+
+#define AGENTSIGHT_TARGET_ATTACHING 2
+
+#define AGENTSIGHT_TARGET_READY 3
+
+#define AGENTSIGHT_TARGET_DEGRADED 4
+
+#define AGENTSIGHT_ADAPT_SYMBOLS 1
+
+#define AGENTSIGHT_ADAPT_BUILD_ID 2
+
 /**
- * Ring-buffer drops and all correlation-map failures are NOT measured in v1.
+ * User queue accounting; correlation-map failures are not fully measured.
  */
 #define AGENTSIGHT_STATS_USER_QUEUE 1
 
@@ -40,6 +54,11 @@
  * Existing aggregation-map overflow counter, best effort (not total kernel loss).
  */
 #define AGENTSIGHT_STATS_AGG_OVERFLOW 2
+
+/**
+ * Failed ring reservations in enhancement open/rename/exec/exit probes.
+ */
+#define AGENTSIGHT_STATS_KERNEL_RING 4
 
 /**
  * Opaque handle. Never copy, dereference or use it after free. Forked children
@@ -55,33 +74,22 @@ typedef struct AgentsightConfig {
   uint32_t struct_size;
   uint32_t abi_version;
   /**
-   * Host-visible PID, or zero to select a cgroup instead. No implicit trace-all.
-   */
-  int32_t target_pid;
-  uint32_t include_cgroup_children;
-  /**
    * Zero selects 1024 events. Maximum 65536.
    */
   uint32_t queue_capacity;
-  uint32_t reserved;
+  /**
+   * Zero selects 1000 ms. Supported range: 100..60000 ms.
+   */
+  uint32_t discovery_interval_ms;
   /**
    * Zero selects 16 MiB. Bounds queued payload + event metadata, not all RSS.
    */
   uint64_t max_queue_bytes;
-  const char *marker_path;
-  const char *asyncio_path;
-  const char *python_path;
   /**
-   * Optional absolute cgroup v2 path visible to the host process.
+   * NULL/empty selects /proc. Requires the host PID namespace, not merely a
+   * host procfs bind mount. No implicit command-name or time-window matching.
    */
-  const char *cgroup_path;
-  /**
-   * Explicit validated ELF file offsets; no universal CPython defaults.
-   */
-  uint64_t task_step_offset;
-  uint64_t task_init_offset;
-  uint64_t context_copy_offset;
-  uint64_t context_run_offset;
+  const char *procfs_root;
 } AgentsightConfig;
 
 /**
@@ -140,6 +148,30 @@ typedef struct AgentsightStats {
   uint64_t aggregate_overflow;
   uint64_t queued_events;
   uint64_t queued_bytes;
+  /**
+   * RUNNING does not imply READY. Inspect this field before claiming capture.
+   */
+  uint32_t target_state;
+  int32_t target_pid;
+  /**
+   * /proc/PID/stat starttime, in clock ticks, not nanoseconds.
+   */
+  uint64_t target_start_ticks;
+  uint64_t target_generation;
+  uint64_t discovery_scans;
+  uint64_t discovery_errors;
+  uint64_t attach_attempts;
+  uint64_t attach_failures;
+  uint64_t target_detaches;
+  /**
+   * Negative errno for the current discovery/attachment failure, or zero.
+   */
+  int32_t target_error;
+  /**
+   * Zero until READY, then AGENTSIGHT_ADAPT_*.
+   */
+  uint32_t adaptation_method;
+  uint64_t kernel_ring_dropped;
 } AgentsightStats;
 
 #ifdef __cplusplus
@@ -162,7 +194,8 @@ int32_t agentsight_init(struct AgentsightHandle **out);
 int32_t agentsight_set_config(struct AgentsightHandle *h, const struct AgentsightConfig *config);
 
 /**
- * Starts one in-process worker. Success means BPF/probes/ring-buffer are ready.
+ * Starts the discovery worker, even if Jiuwen is absent. Success is NOT target readiness.
+ * Inspect get_stats.target_state; unknown runtimes degrade without stopping discovery.
  * Idempotent while running. After stop, drain events before restarting.
  */
 int32_t agentsight_start(struct AgentsightHandle *h);

@@ -155,6 +155,8 @@ static __always_inline int trace_rename_exit_common(long result)
 		event->file_rename.result = result;
 		event->duration_ns = bpf_ktime_get_ns() - event->timestamp_ns;
 		bpf_ringbuf_submit(event, 0);
+	} else {
+		count_python_ring_drop();
 	}
 	bpf_map_delete_elem(&pending_file_renames, &id);
 	return 0;

@@ -41,18 +41,13 @@ static void drain(AgentsightHandle *h)
 
 int main(int argc, char **argv)
 {
-    assert(argc == 9 || argc == 10);
+    assert(argc <= 2);
     AgentsightHandle *h = NULL;
     check(h, agentsight_init(&h));
     AgentsightConfig cfg = {0};
-    cfg.struct_size = sizeof(cfg); cfg.abi_version = 1;
-    cfg.target_pid = atoi(argv[1]);
-    cfg.marker_path = argv[2]; cfg.asyncio_path = argv[3]; cfg.python_path = argv[4];
-    cfg.task_step_offset = strtoull(argv[5], NULL, 0);
-    cfg.task_init_offset = strtoull(argv[6], NULL, 0);
-    cfg.context_copy_offset = strtoull(argv[7], NULL, 0);
-    cfg.context_run_offset = strtoull(argv[8], NULL, 0);
-    if (argc == 10) cfg.queue_capacity = atoi(argv[9]);
+    cfg.struct_size = sizeof(cfg); cfg.abi_version = AGENTSIGHT_ABI_VERSION;
+    cfg.discovery_interval_ms = 100;
+    if (argc == 2) cfg.procfs_root = argv[1];
     check(h, agentsight_set_config(h, &cfg));
     check(h, agentsight_start(h));
     AgentsightHandle *second = NULL;
@@ -62,19 +57,44 @@ int main(int argc, char **argv)
     assert(agentsight_free(second) == 0);
     assert(agentsight_set_config(h, &cfg) < 0);
     assert(agentsight_start(h) == 0);
-    puts("READY"); fflush(stdout);
+    puts("STARTED"); fflush(stdout);
     struct pollfd fds[2] = {{ .fd = agentsight_get_eventfd(h), .events = POLLIN }, { .fd = STDIN_FILENO, .events = POLLIN }};
+    uint32_t last_state = UINT32_MAX;
+    uint64_t last_generation = UINT64_MAX;
+    uint64_t last_scan = UINT64_MAX;
     for (;;) {
-        int rc = poll(fds, 2, 30000);
+        AgentsightStats current;
+        check(h, agentsight_get_stats(h, &current, sizeof(current)));
+        if (last_scan != current.discovery_scans) {
+            printf("{\"discovery_scans\":%llu}\n", (unsigned long long)current.discovery_scans);
+            last_scan = current.discovery_scans;
+            fflush(stdout);
+        }
+        if (current.target_state != last_state || current.target_generation != last_generation) {
+            printf("{\"target_state\":%u,\"target_pid\":%d,\"generation\":%llu,\"adaptation\":%u,\"target_error\":%d}\n",
+                current.target_state, current.target_pid, (unsigned long long)current.target_generation,
+                current.adaptation_method, current.target_error);
+            if (current.target_state == AGENTSIGHT_TARGET_READY) puts("READY");
+            if (current.target_error) {
+                char message[2048] = {0};
+                agentsight_get_last_error(h, message, sizeof(message));
+                printf("DIAGNOSTIC %s\n", message);
+            }
+            last_state = current.target_state;
+            last_generation = current.target_generation;
+            fflush(stdout);
+        }
+        int rc = poll(fds, 2, 100);
         if (rc < 0) continue;
-        if (rc == 0 || (fds[1].revents & (POLLIN | POLLHUP))) {
+        if (fds[1].revents & (POLLIN | POLLHUP)) {
             char command = 0;
             if (rc > 0) (void)read(STDIN_FILENO, &command, 1);
             check(h, agentsight_stop(h));
             drain(h);
             if (command == 'r') {
                 check(h, agentsight_start(h));
-                puts("READY"); fflush(stdout);
+                last_state = UINT32_MAX;
+                puts("STARTED"); fflush(stdout);
                 continue;
             }
             break;
@@ -83,10 +103,11 @@ int main(int argc, char **argv)
     }
     AgentsightStats stats;
     check(h, agentsight_get_stats(h, &stats, sizeof(stats)));
-    printf("{\"stats\":{\"received\":%llu,\"enqueued\":%llu,\"delivered\":%llu,\"dropped\":%llu,\"invalid\":%llu,\"backend_errors\":%llu}}\n",
+    printf("{\"stats\":{\"received\":%llu,\"enqueued\":%llu,\"delivered\":%llu,\"dropped\":%llu,\"invalid\":%llu,\"backend_errors\":%llu,\"kernel_ring_dropped\":%llu}}\n",
            (unsigned long long)stats.received_records, (unsigned long long)stats.enqueued_events,
            (unsigned long long)stats.delivered_events, (unsigned long long)stats.queue_dropped_events,
-           (unsigned long long)stats.invalid_records, (unsigned long long)stats.backend_errors);
+           (unsigned long long)stats.invalid_records, (unsigned long long)stats.backend_errors,
+           (unsigned long long)stats.kernel_ring_dropped);
     check(h, agentsight_free(h));
     return 0;
 }

@@ -25,14 +25,8 @@ import (
 )
 
 func run() error {
-	pid := flag.Int("pid", 0, "target host PID; omit to run only the ABI smoke check")
-	marker := flag.String("marker", "", "absolute marker path")
-	asyncio := flag.String("asyncio", "", "absolute _asyncio ELF path")
-	python := flag.String("python", "", "absolute Python ELF path")
-	step := flag.Uint64("step", 0, "validated task-step file offset")
-	init := flag.Uint64("task-init", 0, "validated task-init file offset")
-	copy := flag.Uint64("context-copy", 0, "validated context-copy file offset")
-	runOffset := flag.Uint64("context-run", 0, "validated context-run file offset")
+	capture := flag.Bool("capture", false, "discover Jiuwen and capture; otherwise only check the ABI")
+	procfs := flag.String("procfs-root", "/proc", "host procfs path; host PID namespace is required")
 	seconds := flag.Int("seconds", 10, "capture duration")
 	flag.Parse()
 	if C.agentsight_abi_version() != C.AGENTSIGHT_ABI_VERSION {
@@ -59,7 +53,7 @@ func run() error {
 	if err := check(fd); err != nil {
 		return err
 	}
-	if *pid == 0 {
+	if !*capture {
 		var stats C.AgentsightStats
 		if err := check(C.agentsight_get_stats(h, &stats, C.sizeof_AgentsightStats)); err != nil {
 			return err
@@ -70,17 +64,8 @@ func run() error {
 	var cfg C.AgentsightConfig
 	cfg.struct_size = C.sizeof_AgentsightConfig
 	cfg.abi_version = C.AGENTSIGHT_ABI_VERSION
-	cfg.target_pid = C.int32_t(*pid)
-	cfg.marker_path = C.CString(*marker)
-	cfg.asyncio_path = C.CString(*asyncio)
-	cfg.python_path = C.CString(*python)
-	defer C.free(unsafe.Pointer(cfg.marker_path))
-	defer C.free(unsafe.Pointer(cfg.asyncio_path))
-	defer C.free(unsafe.Pointer(cfg.python_path))
-	cfg.task_step_offset = C.uint64_t(*step)
-	cfg.task_init_offset = C.uint64_t(*init)
-	cfg.context_copy_offset = C.uint64_t(*copy)
-	cfg.context_run_offset = C.uint64_t(*runOffset)
+	cfg.procfs_root = C.CString(*procfs)
+	defer C.free(unsafe.Pointer(cfg.procfs_root))
 	if err := check(C.agentsight_set_config(h, &cfg)); err != nil {
 		return err
 	}
@@ -112,6 +97,7 @@ func run() error {
 		}
 	}
 	deadline := time.Now().Add(time.Duration(*seconds) * time.Second)
+	lastState := C.uint32_t(^uint32(0))
 	for time.Now().Before(deadline) {
 		C.wait_agentsight(C.int(fd))
 		if err := drain(); err != nil {
@@ -123,6 +109,11 @@ func run() error {
 		}
 		if stats.state == C.AGENTSIGHT_STATE_FAILED {
 			return fmt.Errorf("capture failed; consult get_last_error/get_stats")
+		}
+		if stats.target_state != lastState {
+			fmt.Printf("target_state=%d target_pid=%d generation=%d adaptation=%d error=%d\n",
+				stats.target_state, stats.target_pid, stats.target_generation, stats.adaptation_method, stats.target_error)
+			lastState = stats.target_state
 		}
 	}
 	if err := check(C.agentsight_stop(h)); err != nil {

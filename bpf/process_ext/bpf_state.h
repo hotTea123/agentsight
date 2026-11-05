@@ -148,5 +148,6 @@ const volatile bool trace_signals = false;
 const volatile bool trace_memory = false;
 const volatile bool trace_cow = false;
 const volatile bool trace_python_async_context = false;
+const volatile unsigned int python_target_pid = 0;
 
 #endif /* __PROCESS_EXT_BPF_STATE_H */

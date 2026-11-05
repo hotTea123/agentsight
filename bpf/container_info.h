@@ -12,14 +12,15 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/types.h>
+#include <limits.h>
 
 /* Read namespace PID from /proc/<pid>/status NSpid line.
  * Returns the innermost namespace PID, or -1 if not in a namespace. */
 static int get_ns_pid(pid_t host_pid)
 {
-	char path[64];
+	char path[PATH_MAX];
 	char line[256];
-	snprintf(path, sizeof(path), "/proc/%d/status", host_pid);
+	snprintf(path, sizeof(path), "%s/%d/status", as_procfs_root, host_pid);
 	FILE *f = fopen(path, "r");
 	if (!f)
 		return -1;
@@ -52,9 +53,9 @@ static int get_ns_pid(pid_t host_pid)
  * Writes short (12-char) container ID to out. Returns 0 on success. */
 static int get_container_id(pid_t host_pid, char *out, size_t out_len)
 {
-	char path[64];
+	char path[PATH_MAX];
 	char line[512];
-	snprintf(path, sizeof(path), "/proc/%d/cgroup", host_pid);
+	snprintf(path, sizeof(path), "%s/%d/cgroup", as_procfs_root, host_pid);
 	FILE *f = fopen(path, "r");
 	if (!f)
 		return -1;

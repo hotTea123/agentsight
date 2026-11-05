@@ -4,10 +4,10 @@ cpp_compat = true
 usize_is_size_t = true
 documentation = true
 autogen_warning = "/* Generated from Rust declarations. Do not edit by hand. */"
-header = "/* AgentSight tool-span evidence ABI v1. See README.md for ownership and threading rules. */"
+header = "/* AgentSight tool-span evidence ABI v2. See README.md for ownership and threading rules. */"
 
 [parse]
 parse_deps = false
 
 [export]
-exclude = ["CoreConfig", "as_core_open", "as_core_poll", "as_core_close"]
+exclude = ["CoreConfig", "ElfInfo", "as_core_open", "as_core_poll", "as_core_close", "as_core_target_changed", "as_inspect_elf", "as_validate_code_offset"]

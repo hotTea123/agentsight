@@ -5,6 +5,43 @@
 #define MAX_PYTHON_TASKS 8192
 #define MAX_TASK_PARENT_DEPTH 8
 
+static __always_inline void count_python_ring_drop(void)
+{
+	if (!trace_python_async_context)
+		return;
+	u32 zero = 0;
+	u64 *count = bpf_map_lookup_elem(&file_open_dropped, &zero);
+	if (count)
+		(*count)++;
+}
+
+/* Sticky invalidation survives a dropped EXEC/EXIT ring-buffer record. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u32);
+} python_target_changed SEC(".maps");
+
+static __always_inline void invalidate_python_target(u32 pid)
+{
+	if (!trace_python_async_context || !python_target_pid || pid != python_target_pid)
+		return;
+	u32 zero = 0;
+	u32 *changed = bpf_map_lookup_elem(&python_target_changed, &zero);
+	if (changed)
+		*changed = 1;
+}
+
+static __always_inline bool python_context_enabled(void)
+{
+	if (!trace_python_async_context)
+		return false;
+	u32 zero = 0;
+	u32 *changed = bpf_map_lookup_elem(&python_target_changed, &zero);
+	return changed && !*changed;
+}
+
 struct python_current_task {
 	u64 task_id;
 	u8 source;
@@ -104,6 +141,8 @@ static __always_inline bool current_python_span(
 	u64 *bound_task_id,
 	u8 *source)
 {
+	if (!python_context_enabled())
+		return false;
 	u64 pid_tgid = bpf_get_current_pid_tgid();
 	u32 tgid = pid_tgid >> 32;
 	struct python_current_task *current =
@@ -191,6 +230,7 @@ static __always_inline void propagate_python_context_to_child(u32 child_pid)
 	u64 task_id = 0;
 	u64 bound_task_id = 0;
 	u8 source = ASYNC_CORRELATION_NONE;
+	bpf_map_delete_elem(&python_process_spans, &child_pid);
 
 	if (!trace_python_async_context)
 		return;

@@ -36,7 +36,8 @@ Cargo.lock 中的依赖。`build.rs` 调用 `make ffi-core`，使用独立 PIC l
 1. `agentsight_abi_version()` 与 `AGENTSIGHT_ABI_VERSION` 比较。
 2. `agentsight_init(&handle)`：仅创建句柄，不采集。
 3. `agentsight_set_config(handle, &config)`：检查并深拷贝配置。
-4. `agentsight_start(handle)`：等待必要探针、ring buffer 和工作线程就绪。
+4. `agentsight_start(handle)`：启动发现线程；Jiuwen 尚未运行也可成功返回。
+   再通过 `agentsight_get_stats()` 确认 `target_state == AGENTSIGHT_TARGET_READY`。
 5. `agentsight_get_eventfd(handle)`：获取借用 FD，加入宿主 poll/epoll。
 6. FD 可读后调用 `agentsight_poll_events(handle, events, capacity)`，直到返回 0。
 7. 每个返回的事件调用且仅调用一次 `agentsight_free_event(event)`。
@@ -71,18 +72,48 @@ free 会先 stop 并丢弃尚未取出的队列数据；已取出的事件独立
 - Go 不应把 Go 字符串/切片或未固定的 Go 指针留给后台线程。配置用 C.CString
   传入后可立即释放；poll 输出指针数组使用 C.malloc；事件内容复制到 Go 后释放。
 
-## 配置范围
+## ABI v2 配置与自动发现
 
-清零 `AgentsightConfig`，填写 `struct_size=sizeof(...)` 和 ABI 版本。必须明确
-指定宿主可见的目标 PID，或 cgroup v2 路径；不允许无条件监控所有进程。
-首版路径从采集宿主 namespace 解析，不提供自定义 procfs root 或动态目标管理接口。
-include_cgroup_children 依赖 cgroup_path；子 cgroup 列表定期刷新，非无延迟发现。
+本版本修改了配置/统计结构，**必须使用配套 v2 头文件重新编译宿主**，不能与旧
+v1 二进制混用；业务 marker ABI 仍是 v1。清零 `AgentsightConfig`，填写
+`struct_size=sizeof(...)`、`abi_version=AGENTSIGHT_ABI_VERSION` 即可使用默认配置。
+不再由 ICAgent 提供 PID、Python 路径、marker 路径或四个偏移。
 
-marker、_asyncio、Python ELF 路径及四个文件偏移均为必填。偏移必须由接入方按
-ELF Build ID 校验，本库不包含跨构建自动偏移解析。历史穿刺配置仅适用于已验证的
-CPython 3.11.2 ARM64：24496、19600、2528016、2546048，不能通用于其他构建。
-跨容器应共享 marker 文件/inode，或通过 `/proc/<pid>/root` 定位业务实际文件；
-采集 PID、文件路径和权限也必须位于可访问的宿主命名空间。
+- `procfs_root`：默认 `/proc`；必须是宿主 PID 视图且采集进程在宿主 PID namespace。
+- `discovery_interval_ms`：默认 1000，允许 100～60000；扫描不是零延迟发现。
+- `queue_capacity`、`max_queue_bytes`：控制用户态有界队列。
+
+库扫描进程实际映射的 `libagentsight_tool_marker.so` 并检查三个约定符号，选择唯一
+独立业务根进程。fork 后继承 marker 的已观察子进程不成为新根；多个独立候选则
+明确降级，不按名字/时间猜选。文件通过 `map_files` 固定到实际映射；无该权限时
+回退 `/proc/PID/root`，仍必须核对设备号和 inode，无法确认就不挂载。
+
+Python 适配读取实际加载的 `_asyncio`、Python 可执行文件或 `libpython` ELF，
+不运行目标 Python，不加载目标代码进入 ICAgent：
+
+1. CPython 3.11 探针模型且四个函数符号齐全：libbpf 按符号解析文件偏移。
+2. 符号缺失：仅命中经过验证的 **Python + _asyncio 双 Build ID** 才使用内置偏移。
+3. 其他版本、未知剥离构建或架构不匹配：`DEGRADED`，不猜偏移，不阻止 Jiuwen。
+
+目前真实采集验证为 CPython 3.11.2 ARM64；完整符号路径有 ELF/规则测试，但没有
+覆盖所有 3.11 构建，不能承诺任意 Python 升级自动兼容。新增小版本探针模型或
+未知剥离构建仍需库内适配与验证，ICAgent 接口无需再次提供偏移。
+
+当前已验证的双 Build ID：Python `d190c32fa97c85641233f1a813582deecb960b8c`，
+_asyncio `1007e17e3911f3b90839a8823bc3228925b817d0`。四个偏移为
+24496、19600、2528016、2546048，**仅属于该配置，不能按版本号直接复用**。
+
+`target_state` 为 IDLE / WAITING / ATTACHING / READY / DEGRADED。
+RUNNING 只表示发现线程工作，不代表已经增强。库持续扫描、重试，进程退出或
+同 PID exec 会通过内核 sticky 标记失效旧关联、卸载探针并重新发现；成功挂载增加
+`target_generation`。重挂会有证据缺口，不恢复工具绑定，已入队证据保留原 ID。
+扫描每批进程之间继续非阻塞读取采集缓冲区；增强模式在内核侧过滤无关 open/exec/exit，
+业务中未绑定工具的 open 仅用于 FD 跟踪，不进入证据队列。
+
+容器仅挂载 host `/proc` 但不共享宿主 PID namespace 尚不支持。私有 PID namespace
+下的 `/proc` 自检不能证明看到了整台宿主机，部署端必须满足上述条件。首次扫描前
+已成为孤儿的 fork 子进程无法仅靠映射还原来源；本期仍按一个节点一个业务根进程
+的部署约定使用。marker 是协作标识，不是安全认证或租户隔离边界。
 
 默认队列 1024 条/16 MiB。队列满时立即丢弃新证据并计数，不等待宿主腾出空间。
 max_queue_bytes 约束排队的序列化数据和事件元数据，不是宿主 RSS 的上限；BPF maps、
@@ -110,9 +141,12 @@ timestamp_ns 是内核 CLOCK_MONOTONIC；wall_time_ns 使用本机双时钟锚�
 
 ## 统计与限制
 
-get_stats 返回生命周期状态、记录过滤/解析失败、入队/出队、队列满丢弃、序列化
+get_stats 还返回目标状态/PID/启动代次、适配方式、扫描错误、挂载尝试/失败和卸载数。
+`kernel_ring_dropped` 统计增强 open/rename/exec/exit 探针的 ring-buffer 申请失败；
+`supported_counters` 的 `AGENTSIGHT_STATS_KERNEL_RING` 位表明提供该项。
+并返回生命周期状态、记录过滤/解析失败、入队/出队、队列满丢弃、序列化
 丢弃、后台错误/诊断、排队量和已有聚合 map 溢出统计。聚合溢出是既有计数器的
-尽力统计；**尚不覆盖全部 kernel ring-buffer 丢失、Task/context map 满或关联失效**，
+尽力统计；**尚不覆盖全部 Task/context map 满、读取失败或关联失效**，
 不能把全部已提供计数为零理解成“没有任何证据缺口”。
 
 继续继承当前穿刺的 CPython 版本、Task/PyContext/PID 复用、固定 map 容量/链深、
@@ -126,7 +160,14 @@ get_stats 返回生命周期状态、记录过滤/解析失败、入队/出队�
 检查 C++ 布局与调用。`tests/test_live.py` 在独立测试目录使用正式 LocalFunction/
 callback 和真实 BPF 检查 ID、四种关联来源、异常、重启及关闭增强对照，不访问 Jaeger。
 
+`tests/test_discovery.py` 验证延迟加载、同 PID exec、fork/已观察孤儿排除、进程重启
+和多根歧义。未知 stripped ELF 对照使用修改 Build ID 的独立测试副本，不修改系统 Python。
+
 Go 示例在交付目录中可执行 `GO111MODULE=off go run ./examples/go`，无参数只验证
-ABI/生命周期；真实采集需要传入 pid、marker、asyncio、python 及四个偏移。
+ABI/生命周期；真实采集使用 `-capture -seconds 30`，可选 `-procfs-root /proc`。
 它不是 ICAgent 插件实现。**ICAgent 内部接线、实际 Jaeger 上报、x86_64、cgroup
 多容器隔离和生产性能必须由后续集成测试验证**。实际通过项以随包测试报告为准。
+
+替换头文件或 `.so` 后，应在示例/宿主包目录中强制重新编译（例如 `go build -a`）；
+Go 的构建缓存可能未感知包目录外的 C 头文件变化。出现
+`stats buffer too small` 时先检查配套头文件和缓存，不应忽略返回码继续读结构体。

@@ -223,7 +223,8 @@ ffi-core: $(OUTPUT)/process.skel.h
 		INCLUDEDIR= LIBDIR= UAPIDIR= install
 	$(Q)$(CC) $(CFLAGS) -Werror=implicit-function-declaration -O2 -fPIC -fvisibility=hidden -DAGENTSIGHT_LIBRARY \
 		$(INCLUDES) -c process.c -o $(FFI_OUTPUT)/process_core.o
-	$(Q)ar rcs $(FFI_OUTPUT)/libagentsight_core.a $(FFI_OUTPUT)/process_core.o
+	$(Q)$(CC) $(CFLAGS) -O2 -fPIC -fvisibility=hidden -c python_runtime.c -o $(FFI_OUTPUT)/python_runtime.o
+	$(Q)ar rcs $(FFI_OUTPUT)/libagentsight_core.a $(FFI_OUTPUT)/process_core.o $(FFI_OUTPUT)/python_runtime.o
 
 # Build BPF code
 $(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(wildcard %.h) $(VMLINUX) | $(OUTPUT) $(BPFTOOL)
