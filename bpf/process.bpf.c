@@ -63,6 +63,8 @@ struct {
 const volatile unsigned long long min_duration_ns = 0;
 
 #include "process_ext/bpf_common.h"
+#include "process_ext/python_async_context.h"
+#include "process_ext/bpf_file_descriptors.h"
 
 /* Bash readline uretprobe handler */
 SEC("uretprobe//usr/bin/bash:readline")
@@ -97,6 +99,7 @@ int BPF_URETPROBE(bash_readline, const void *ret)
 	e->duration_ns = 0;
 	e->timestamp_ns = bpf_ktime_get_ns();
 	e->exit_event = false;
+	fill_python_async_context(e);
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 	bpf_probe_read_user_str(&e->command, sizeof(e->command), ret);
 
@@ -140,6 +143,7 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	e->pid = pid;
 	e->ppid = BPF_CORE_READ(task, real_parent, tgid);
 	e->timestamp_ns = ts;
+	fill_python_async_context(e);
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
 	fname_off = ctx->__data_loc_filename & 0xFFFF;
@@ -211,6 +215,9 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 	pid = id >> 32;
 	tid = (u32)id;
 
+	/* Also clean pending entries for threads that never reach syscall exit. */
+	bpf_map_delete_elem(&pending_file_renames, &id);
+
 	/* ignore thread exits */
 	if (pid != tid)
 		return 0;
@@ -242,6 +249,7 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 	e->pid = pid;
 	e->ppid = BPF_CORE_READ(task, real_parent, tgid);
 	e->timestamp_ns = ts;
+	fill_python_async_context(e);
 	e->exit_code = (BPF_CORE_READ(task, exit_code) >> 8) & 0xff;
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
@@ -278,6 +286,7 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
 	dfd = (int)ctx->args[0];
 	filename = (const char *)ctx->args[1];
 	flags = (int)ctx->args[2];
+	track_file_open_enter(filename, flags);
 
 	/* Read filename from user space */
 	if (bpf_probe_read_user_str(filepath, sizeof(filepath), filename) < 0)
@@ -296,6 +305,7 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
 	e->duration_ns = 0;
 	e->timestamp_ns = bpf_ktime_get_ns();
 	e->exit_event = false;
+	fill_python_async_context(e);
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
 	/* Copy filepath and set file open details */
@@ -328,6 +338,7 @@ int trace_open(struct trace_event_raw_sys_enter *ctx)
 	/* Get syscall arguments */
 	filename = (const char *)ctx->args[0];
 	flags = (int)ctx->args[1];
+	track_file_open_enter(filename, flags);
 
 	/* Read filename from user space */
 	if (bpf_probe_read_user_str(filepath, sizeof(filepath), filename) < 0)
@@ -346,6 +357,7 @@ int trace_open(struct trace_event_raw_sys_enter *ctx)
 	e->duration_ns = 0;
 	e->timestamp_ns = bpf_ktime_get_ns();
 	e->exit_event = false;
+	fill_python_async_context(e);
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
 	/* Copy filepath and set file open details */
@@ -446,6 +458,7 @@ int BPF_PROG(trace_file_open_exit, struct file *file)
 	e->duration_ns = 0;
 	e->timestamp_ns = bpf_ktime_get_ns();
 	e->exit_event = false;
+	fill_python_async_context(e);
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 	e->file_op.fd = -1;
 	e->file_op.flags = flags;

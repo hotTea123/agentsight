@@ -173,6 +173,33 @@ enum DebugCommand {
         /// Include prompt/completion content in exported GenAI spans (opt-in; off by default for privacy)
         #[arg(long)]
         otel_capture_content: bool,
+        /// Export AgentSight file/process evidence as children of instrumented tool spans
+        #[arg(long, requires = "otel")]
+        otel_tool_enhancement: bool,
+        /// Track CPython asyncio Task and contextvars execution state
+        #[arg(long, requires = "process")]
+        python_async_context: bool,
+        /// Path to AgentSight's native tool marker library loaded by the target
+        #[arg(long)]
+        python_marker_library: Option<String>,
+        /// Path to the target process _asyncio extension
+        #[arg(long)]
+        python_asyncio_lib: Option<String>,
+        /// Path to the target Python runtime binary or library
+        #[arg(long)]
+        python_runtime: Option<String>,
+        /// _asyncio task step implementation file offset
+        #[arg(long)]
+        python_task_step_offset: Option<u64>,
+        /// _asyncio task init file offset
+        #[arg(long)]
+        python_task_init_offset: Option<u64>,
+        /// PyContext_CopyCurrent file offset
+        #[arg(long)]
+        python_context_copy_offset: Option<u64>,
+        /// context_run file offset
+        #[arg(long)]
+        python_context_run_offset: Option<u64>,
         /// Binary path or container ref to monitor (e.g., /usr/bin/node, docker://name, k8s://ns/pod/container)
         #[arg(long)]
         binary_path: Option<String>,
@@ -322,6 +349,15 @@ pub(crate) async fn run(
             otel,
             otel_endpoint,
             otel_capture_content,
+            otel_tool_enhancement,
+            python_async_context,
+            python_marker_library,
+            python_asyncio_lib,
+            python_runtime,
+            python_task_step_offset,
+            python_task_init_offset,
+            python_context_copy_offset,
+            python_context_run_offset,
             binary_path,
             db,
             quiet,
@@ -341,6 +377,14 @@ pub(crate) async fn run(
                     ssl_raw_data: *ssl_raw_data,
                     process: *process,
                     trace_net: *trace_net,
+                    python_async_context: *python_async_context,
+                    python_marker_library: python_marker_library.clone(),
+                    python_asyncio_lib: python_asyncio_lib.clone(),
+                    python_runtime: python_runtime.clone(),
+                    python_task_step_offset: *python_task_step_offset,
+                    python_task_init_offset: *python_task_init_offset,
+                    python_context_copy_offset: *python_context_copy_offset,
+                    python_context_run_offset: *python_context_run_offset,
                     stdio: *stdio,
                     stdio_uid: *stdio_uid,
                     stdio_comm: stdio_comm.clone(),
@@ -355,6 +399,7 @@ pub(crate) async fn run(
                     otel: otel.then(|| OtelConfig {
                         endpoint: otel_endpoint.clone(),
                         capture_content: *otel_capture_content,
+                        tool_enhancement: *otel_tool_enhancement,
                     }),
                     binary_path: binary_path.clone(),
                     db_path: configured_db_path(db),

@@ -32,6 +32,7 @@ ALL_LDFLAGS += $(ASAN_FLAGS)
 endif
 
 APPS = sslsniff stdiocap process test_process_utils test_process_filter test_process_ext_map_flush test_process_ext_types test_codex_offsets test_sslsniff_output test_sslsniff_transport_identity test_sslsniff_transport_identity_boringssl # minimal minimal_legacy uprobe kprobe fentry usdt sockfilter tc ksyscall
+MARKER_LIB = libagentsight_tool_marker.so
 
 # Experimental programs: built only via `make experimental` (or by name), not
 # shipped in the default build or embedded into the collector.
@@ -83,7 +84,7 @@ $(call allow-override,CC,$(CROSS_COMPILE)cc)
 $(call allow-override,LD,$(CROSS_COMPILE)ld)
 
 .PHONY: all
-all: $(APPS)
+all: $(APPS) $(MARKER_LIB)
 
 .PHONY: experimental
 experimental: $(EXPERIMENTAL_APPS)
@@ -99,7 +100,7 @@ sslsniff-debug:
 .PHONY: clean
 clean:
 	$(call msg,CLEAN)
-	$(Q)rm -rf $(OUTPUT) $(APPS) $(EXPERIMENTAL_APPS)
+	$(Q)rm -rf $(OUTPUT) $(APPS) $(EXPERIMENTAL_APPS) $(MARKER_LIB)
 
 .PHONY: help
 help:
@@ -209,6 +210,20 @@ $(LIBBLAZESYM_HEADER): $(LIBBLAZESYM_SRC)/target/release/libblazesym.a | $(OUTPU
 
 # Extra dependencies for process BPF extension headers
 $(OUTPUT)/process.bpf.o: $(wildcard process_ext/*.h)
+$(OUTPUT)/process.o: $(wildcard process_ext/*.h) process_output.h process_core.h
+
+# Separate PIC dependency tree for the in-process library; never reuse the
+# CLI's libbpf archive. Cargo links these archives with private visibility.
+FFI_OUTPUT := .output-ffi
+.PHONY: ffi-core
+ffi-core: $(OUTPUT)/process.skel.h
+	$(Q)mkdir -p $(FFI_OUTPUT)/libbpf
+	$(Q)$(MAKE) -C $(LIBBPF_SRC) BUILD_STATIC_ONLY=1 CFLAGS='-g -O2 -fPIC -fvisibility=hidden' \
+		OBJDIR=$(abspath $(FFI_OUTPUT)/libbpf) DESTDIR=$(abspath $(FFI_OUTPUT)) \
+		INCLUDEDIR= LIBDIR= UAPIDIR= install
+	$(Q)$(CC) $(CFLAGS) -Werror=implicit-function-declaration -O2 -fPIC -fvisibility=hidden -DAGENTSIGHT_LIBRARY \
+		$(INCLUDES) -c process.c -o $(FFI_OUTPUT)/process_core.o
+	$(Q)ar rcs $(FFI_OUTPUT)/libagentsight_core.a $(FFI_OUTPUT)/process_core.o
 
 # Build BPF code
 $(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(wildcard %.h) $(VMLINUX) | $(OUTPUT) $(BPFTOOL)
@@ -267,6 +282,10 @@ $(OUTPUT)/test_sslsniff_output.o: tests/test_sslsniff_output.c sslsniff_output.h
 $(OUTPUT)/%.o: %.c $(wildcard %.h) | $(OUTPUT)
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $(filter %.c,$^) -o $@
+
+$(MARKER_LIB): agentsight_tool_marker.c
+	$(call msg,SHARED,$@)
+	$(Q)$(CC) $(CFLAGS) -fPIC -shared $< -o $@
 
 $(patsubst %,$(OUTPUT)/%.o,$(BZS_APPS)): $(LIBBLAZESYM_HEADER)
 

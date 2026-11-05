@@ -18,7 +18,7 @@
 //! stable view data to OTLP.
 //!
 use crate::analyzers::AnalyzerError;
-use crate::model::{LlmCallRow, ViewResult, ViewSink};
+use crate::model::{AuditEventRow, LlmCallRow, ViewResult, ViewSink};
 use crate::view::llm::provider_from_host;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -64,6 +64,8 @@ pub struct OtelExporter {
     service_name: String,
     /// Whether to attach prompt/completion content (`gen_ai.{input,output}.messages`).
     capture_content: bool,
+    /// Export correlated file/process evidence as children of instrumented tool spans.
+    tool_enhancement: bool,
     /// Trace IDs assigned to conversation/session identifiers in this recording.
     trace_ids: HashMap<String, String>,
     /// Recording-scoped trace used when a call has no correlation identifier.
@@ -77,6 +79,15 @@ impl OtelExporter {
     /// honored, falling back to `http://localhost:4318`. A full traces endpoint
     /// in `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` takes precedence and is used as-is.
     pub fn new(endpoint: Option<String>, capture_content: bool) -> Self {
+        Self::new_with_tool_enhancement(endpoint, capture_content, false)
+    }
+
+    /// Create an exporter that augments existing instrumented tool spans.
+    pub fn new_with_tool_enhancement(
+        endpoint: Option<String>,
+        capture_content: bool,
+        tool_enhancement: bool,
+    ) -> Self {
         let traces_url = if let Ok(full) = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") {
             full
         } else {
@@ -93,6 +104,7 @@ impl OtelExporter {
             traces_url,
             service_name,
             capture_content,
+            tool_enhancement,
             trace_ids: HashMap::new(),
             fallback_trace_id: new_trace_id(),
             client: Arc::new(Client::builder(TokioExecutor::new()).build_http()),
@@ -116,6 +128,176 @@ impl OtelExporter {
             .or_insert_with(new_trace_id)
             .clone()
     }
+}
+
+fn valid_hex_id(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value.bytes().any(|byte| byte != b'0')
+}
+
+fn syscall_error_name(errno: i32) -> String {
+    match errno {
+        libc::EACCES => "EACCES".to_string(),
+        libc::EPERM => "EPERM".to_string(),
+        libc::ENOENT => "ENOENT".to_string(),
+        libc::EEXIST => "EEXIST".to_string(),
+        libc::EXDEV => "EXDEV".to_string(),
+        libc::ENOTDIR => "ENOTDIR".to_string(),
+        libc::EISDIR => "EISDIR".to_string(),
+        libc::ENOTEMPTY => "ENOTEMPTY".to_string(),
+        libc::EROFS => "EROFS".to_string(),
+        libc::ENOSPC => "ENOSPC".to_string(),
+        libc::EINVAL => "EINVAL".to_string(),
+        libc::EBADF => "EBADF".to_string(),
+        _ => format!("errno.{errno}"),
+    }
+}
+
+fn build_correlated_audit_payload(service_name: &str, row: &AuditEventRow) -> Option<Value> {
+    let trace_id = row
+        .details
+        .get("agentsight_trace_id")
+        .and_then(Value::as_str)?;
+    let parent_span_id = row
+        .details
+        .get("agentsight_parent_span_id")
+        .and_then(Value::as_str)?;
+    if !valid_hex_id(trace_id, 32) || !valid_hex_id(parent_span_id, 16) {
+        return None;
+    }
+
+    let action = row.action.as_deref().unwrap_or("event");
+    let span_name = match (row.audit_type.as_str(), action) {
+		("file", "open") if is_read_only_file_open(row) => "agentsight.file.open",
+        ("file", "write") => "agentsight.file.write",
+		("file", "rename") => "agentsight.file.rename",
+        ("process", "exec") => "agentsight.process.exec",
+        _ => return None,
+    };
+    let mut attributes = vec![
+        attr_str("agentsight.evidence.type", &row.audit_type),
+        attr_str("agentsight.evidence.action", action),
+    ];
+    let mut status = json!({ "code": 1 });
+    if let Some(target) = row.target.as_deref() {
+        attributes.push(attr_str("agentsight.evidence.target", target));
+        match row.audit_type.as_str() {
+            "file" => attributes.push(attr_str("file.path", target)),
+            "process" => attributes.push(attr_str("process.executable.path", target)),
+            _ => {}
+        }
+    }
+	match action {
+		"open" => attributes.push(attr_str("file.access_mode", "read_only")),
+		"write" => {
+			if let Some(bytes) = row.details.get("total_bytes").and_then(Value::as_u64) {
+				attributes.push(attr_int("file.write.bytes", bytes as i64));
+			}
+			if let Some(count) = row.details.get("count").and_then(Value::as_u64) {
+				attributes.push(attr_int("file.write.operation_count", count as i64));
+			}
+		}
+		"rename" => {
+            // Legacy entry-only records have no result: do not report success.
+            status = json!({ "code": 0 });
+            if let Some(result) = row.details.get("syscall_return").and_then(Value::as_i64) {
+                attributes.push(attr_int("syscall.return", result));
+                if result == 0 {
+                    status = json!({ "code": 1 });
+                } else if (-4095..=-1).contains(&result) {
+                    let errno = (-result) as i32;
+                    let error_type = syscall_error_name(errno);
+                    attributes.push(attr_int("syscall.errno", i64::from(errno)));
+                    attributes.push(attr_str("error.type", &error_type));
+                    status = json!({ "code": 2, "message": error_type });
+                }
+            }
+            if let Some(name) = row.details.get("syscall_name").and_then(Value::as_str) {
+                attributes.push(attr_str("syscall.name", name));
+            }
+            for (field, attribute) in [
+                ("source_dirfd", "file.source.dirfd"),
+                ("destination_dirfd", "file.destination.dirfd"),
+                ("rename_flags", "file.rename.flags"),
+                ("count", "file.rename.operation_count"),
+            ] {
+                if let Some(value) = row.details.get(field).and_then(Value::as_i64) {
+                    attributes.push(attr_int(attribute, value));
+                }
+            }
+			if let Some(source) = row.details.get("source_path").and_then(Value::as_str) {
+				attributes.push(attr_str("file.source.path", source));
+			}
+			if let Some(destination) = row
+				.details
+				.get("destination_path")
+				.and_then(Value::as_str)
+			{
+				attributes.push(attr_str("file.destination.path", destination));
+			}
+		}
+		_ => {}
+	}
+    if let Some(pid) = row.pid {
+        attributes.push(attr_int("process.pid", i64::from(pid)));
+    }
+    if let Some(comm) = row.comm.as_deref() {
+        attributes.push(attr_str("process.command", comm));
+    }
+    for key in [
+        "agentsight_correlation_source",
+        "agentsight_task_id",
+        "agentsight_bound_task_id",
+    ] {
+        if let Some(value) = row.details.get(key).and_then(Value::as_str) {
+            attributes.push(attr_str(&key.replace('_', "."), value));
+        }
+    }
+    if let Some(tid) = row.details.get("tid").and_then(Value::as_u64) {
+        attributes.push(attr_int("thread.id", tid as i64));
+    }
+
+    let flags = row
+        .details
+        .get("agentsight_trace_flags")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let start_unix_nano = (row.timestamp_ms as u128) * 1_000_000;
+    let duration_ns = if action == "rename" {
+        row.details.get("duration_ns").and_then(Value::as_u64).filter(|n| *n > 0)
+    } else {
+        None
+    }.unwrap_or(1_000);
+    Some(json!({
+        "resourceSpans": [{
+            "resource": { "attributes": [attr_str("service.name", service_name)] },
+            "scopeSpans": [{
+                "scope": { "name": "agentsight", "version": env!("CARGO_PKG_VERSION") },
+                "spans": [{
+                    "traceId": trace_id,
+                    "spanId": new_span_id(),
+                    "parentSpanId": parent_span_id,
+                    "flags": flags,
+                    "name": span_name,
+                    "kind": 1,
+                    "startTimeUnixNano": start_unix_nano.to_string(),
+                    "endTimeUnixNano": (start_unix_nano + u128::from(duration_ns)).to_string(),
+                    "attributes": attributes,
+                    "status": status
+                }]
+            }]
+        }]
+    }))
+}
+
+fn is_read_only_file_open(row: &AuditEventRow) -> bool {
+	let flags = row.details.get("flags").and_then(Value::as_i64).unwrap_or(0);
+	const O_ACCMODE: i64 = 0o3;
+	const O_CREAT: i64 = 0o100;
+	const O_TRUNC: i64 = 0o1000;
+	const O_APPEND: i64 = 0o2000;
+	(flags & O_ACCMODE) == 0 && (flags & (O_CREAT | O_TRUNC | O_APPEND)) == 0
 }
 
 /// Pull an integer token count from a usage object, tolerating both the
@@ -380,6 +562,9 @@ impl SpanInput {
 
 impl ViewSink for OtelExporter {
     fn llm_call(&mut self, call: &LlmCallRow) -> ViewResult<()> {
+        if self.tool_enhancement {
+            return Ok(());
+        }
         let Some(end_ms) = call.end_timestamp_ms else {
             return Ok(());
         };
@@ -404,6 +589,23 @@ impl ViewSink for OtelExporter {
         tokio::spawn(async move {
             if let Err(e) = post_otlp(&client, &url, payload).await {
                 log::warn!("OtelExporter: failed to export span: {}", e);
+            }
+        });
+        Ok(())
+    }
+
+    fn audit_event(&mut self, row: &AuditEventRow) -> ViewResult<()> {
+        if !self.tool_enhancement {
+            return Ok(());
+        }
+        let Some(payload) = build_correlated_audit_payload(&self.service_name, row) else {
+            return Ok(());
+        };
+        let client = self.client.clone();
+        let url = self.traces_url.clone();
+        tokio::spawn(async move {
+            if let Err(e) = post_otlp(&client, &url, payload).await {
+                log::warn!("OtelExporter: failed to export enhanced tool span: {}", e);
             }
         });
         Ok(())
@@ -720,5 +922,177 @@ mod tests {
             exporter.trace_id_for(None, None)
         );
         assert_ne!(new_span_id(), new_span_id());
+    }
+
+    #[test]
+    fn correlated_file_open_keeps_instrumented_trace_and_parent() {
+        let row = AuditEventRow {
+            id: "audit-1".to_string(),
+            timestamp_ms: 1_234,
+            audit_type: "file".to_string(),
+            pid: Some(42),
+            comm: Some("python3".to_string()),
+            subject: Some("python3".to_string()),
+            action: Some("open".to_string()),
+            target: Some("/tmp/input.txt".to_string()),
+            status: Some("observed".to_string()),
+            summary: None,
+            details: json!({
+                "tid": 43,
+                "agentsight_trace_id": "0123456789abcdef0123456789abcdef",
+                "agentsight_parent_span_id": "fedcba9876543210",
+                "agentsight_trace_flags": 1,
+                "agentsight_task_id": "0000aaaabbbbcccc",
+                "agentsight_bound_task_id": "0000aaaabbbbcccc",
+                "agentsight_correlation_source": "task"
+            }),
+            view_source: "view".to_string(),
+            confidence: Some(0.75),
+        };
+
+        let payload = build_correlated_audit_payload("agentsight-enhancement", &row)
+            .expect("correlated payload");
+        let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["traceId"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(span["parentSpanId"], "fedcba9876543210");
+        assert_eq!(span["name"], "agentsight.file.open");
+        assert_eq!(span["kind"], 1);
+        assert_eq!(span["startTimeUnixNano"], "1234000000");
+    }
+
+    #[test]
+    fn writable_file_open_is_kept_out_of_enhancement_export() {
+        let row = AuditEventRow {
+            id: "audit-write-open".to_string(),
+            timestamp_ms: 1,
+            audit_type: "file".to_string(),
+            pid: Some(42),
+            comm: Some("python3".to_string()),
+            subject: None,
+            action: Some("open".to_string()),
+            target: Some("/tmp/context.tmp".to_string()),
+            status: None,
+            summary: None,
+            details: json!({
+                "flags": 577,
+                "agentsight_trace_id": "0123456789abcdef0123456789abcdef",
+                "agentsight_parent_span_id": "fedcba9876543210"
+            }),
+            view_source: "view".to_string(),
+            confidence: None,
+        };
+
+        assert!(build_correlated_audit_payload("agentsight", &row).is_none());
+    }
+
+    #[test]
+    fn correlated_write_and_rename_map_semantic_file_attributes() {
+        let base_details = json!({
+            "tid": 43,
+            "agentsight_trace_id": "0123456789abcdef0123456789abcdef",
+            "agentsight_parent_span_id": "fedcba9876543210",
+            "agentsight_trace_flags": 1,
+            "agentsight_task_id": "0000aaaabbbbcccc",
+            "agentsight_bound_task_id": "0000aaaabbbbcccc",
+            "agentsight_correlation_source": "task"
+        });
+        let mut write_details = base_details.clone();
+        write_details["count"] = json!(2);
+        write_details["total_bytes"] = json!(142);
+        let write = AuditEventRow {
+            id: "audit-write".to_string(),
+            timestamp_ms: 2,
+            audit_type: "file".to_string(),
+            pid: Some(42),
+            comm: Some("python3".to_string()),
+            subject: None,
+            action: Some("write".to_string()),
+            target: Some("/tmp/context.tmp".to_string()),
+            status: None,
+            summary: None,
+            details: write_details,
+            view_source: "view".to_string(),
+            confidence: None,
+        };
+        let write_payload = build_correlated_audit_payload("service", &write).expect("write payload");
+        let write_span = &write_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(write_span["name"], "agentsight.file.write");
+        assert!(write_span["attributes"].as_array().unwrap().iter().any(|attribute| {
+            attribute["key"] == "file.write.bytes" && attribute["value"]["intValue"] == "142"
+        }));
+
+        let mut rename_details = base_details;
+        rename_details["source_path"] = json!("/tmp/context.tmp");
+        rename_details["destination_path"] = json!("/tmp/context.json");
+        let mut rename = AuditEventRow {
+            id: "audit-rename".to_string(),
+            timestamp_ms: 3,
+            audit_type: "file".to_string(),
+            pid: Some(42),
+            comm: Some("python3".to_string()),
+            subject: None,
+            action: Some("rename".to_string()),
+            target: Some("/tmp/context.json".to_string()),
+            status: None,
+            summary: None,
+            details: rename_details,
+            view_source: "view".to_string(),
+            confidence: None,
+        };
+        let rename_payload =
+            build_correlated_audit_payload("service", &rename).expect("rename payload");
+        let rename_span = &rename_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(rename_span["name"], "agentsight.file.rename");
+        assert!(rename_span["attributes"].as_array().unwrap().iter().any(|attribute| {
+            attribute["key"] == "file.source.path"
+                && attribute["value"]["stringValue"] == "/tmp/context.tmp"
+        }));
+        assert!(rename_span["attributes"].as_array().unwrap().iter().any(|attribute| {
+            attribute["key"] == "file.destination.path"
+                && attribute["value"]["stringValue"] == "/tmp/context.json"
+        }));
+        assert_eq!(rename_span["status"]["code"], 0, "entry-only result is unknown");
+        for (result, code, error) in [
+            (0, 1, None),
+            (-13, 2, Some("EACCES")),
+            (-2, 2, Some("ENOENT")),
+            (-999, 2, Some("errno.999")),
+        ] {
+            rename.details["syscall_return"] = json!(result);
+            rename.details["duration_ns"] = json!(4500);
+            rename.details["count"] = json!(1);
+            let payload = build_correlated_audit_payload("service", &rename).unwrap();
+            let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+            assert_eq!(span["traceId"], "0123456789abcdef0123456789abcdef");
+            assert_eq!(span["parentSpanId"], "fedcba9876543210");
+            assert_ne!(span["spanId"], span["parentSpanId"]);
+            assert_eq!(span["status"]["code"], code);
+            assert_eq!(span["endTimeUnixNano"], "3004500");
+            let attrs = span["attributes"].as_array().unwrap();
+            assert!(attrs.iter().any(|a| a["key"] == "syscall.return"
+                && a["value"]["intValue"] == result.to_string()));
+            let error_attr = attrs.iter().find(|a| a["key"] == "error.type");
+            assert_eq!(error_attr.map(|a| a["value"]["stringValue"].as_str().unwrap()), error);
+        }
+    }
+
+    #[test]
+    fn uncorrelated_audit_is_not_exported() {
+        let row = AuditEventRow {
+            id: "audit-1".to_string(),
+            timestamp_ms: 1,
+            audit_type: "file".to_string(),
+            pid: None,
+            comm: None,
+            subject: None,
+            action: Some("open".to_string()),
+            target: Some("/tmp/input.txt".to_string()),
+            status: None,
+            summary: None,
+            details: json!({}),
+            view_source: "view".to_string(),
+            confidence: None,
+        };
+        assert!(build_correlated_audit_payload("agentsight", &row).is_none());
     }
 }

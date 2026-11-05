@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 /* Copyright (c) 2020 Facebook */
+#include "process_output.h"
+#include "process_core.h"
+#include <poll.h>
 #include <argp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -22,6 +25,7 @@
 #include "container_info.h"
 #include "process_ext/map_flush.h"
 #include "process_ext/userspace.h"
+#include "process_ext/python_async_userspace.h"
 
 #define MAX_COMMAND_LIST 256
 #define MAX_SEED_PIDS 4096
@@ -79,6 +83,14 @@ static struct env {
 	bool trace_mem;
 	bool trace_cow;
 	unsigned heartbeat_seconds;
+	bool trace_python_async_context;
+	char python_marker_library[PATH_MAX];
+	char python_asyncio_path[PATH_MAX];
+	char python_runtime_path[PATH_MAX];
+	unsigned long long python_task_step_offset;
+	unsigned long long python_task_init_offset;
+	unsigned long long python_context_copy_offset;
+	unsigned long long python_context_run_offset;
 	char cgroup_filter_path[256];
 	bool cgroup_filter_enabled;
 	bool cgroup_filter_children;
@@ -98,6 +110,7 @@ static struct env {
 /* Global PID tracker for userspace filtering */
 static struct pid_tracker pid_tracker;
 static int g_agg_map_fd = -1;
+static int g_correlated_file_agg_map_fd = -1;
 static int g_tracked_pids_fd = -1;
 static int g_tracked_cgroups_fd = -1;
 static int g_overflow_fd = -1;
@@ -107,6 +120,7 @@ static int g_file_open_prog_fd = -1;
 static uint64_t g_file_open_drops_reported;
 static long page_size_kb;
 
+#ifndef AGENTSIGHT_LIBRARY
 const char *argp_program_version = "process-tracer 1.0";
 const char *argp_program_bug_address = "<bpf@vger.kernel.org>";
 const char argp_program_doc[] =
@@ -146,6 +160,14 @@ enum {
 	OPT_SEED_PID,
 	OPT_HEARTBEAT,
 	OPT_PIDNS_OF,
+	OPT_PYTHON_ASYNC_CONTEXT,
+	OPT_PYTHON_MARKER_LIBRARY,
+	OPT_PYTHON_ASYNCIO_PATH,
+	OPT_PYTHON_RUNTIME_PATH,
+	OPT_PYTHON_TASK_STEP_OFFSET,
+	OPT_PYTHON_TASK_INIT_OFFSET,
+	OPT_PYTHON_CONTEXT_COPY_OFFSET,
+	OPT_PYTHON_CONTEXT_RUN_OFFSET,
 };
 
 static const struct argp_option opts[] = {
@@ -167,8 +189,28 @@ static const struct argp_option opts[] = {
 	{ "seed-pid", OPT_SEED_PID, "PID[:PPID]", 0, "Seed an existing tracked PID supplied by the collector" },
 	{ "heartbeat", OPT_HEARTBEAT, "SECONDS", 0, "Print start and periodic alive records" },
 	{ "pidns-of", OPT_PIDNS_OF, "PID", 0, "Hard filter to the PID namespace of /proc/PID and namespaces nested in it" },
+	{ "python-async-context", OPT_PYTHON_ASYNC_CONTEXT, NULL, 0, "Correlate CPython asyncio tasks with tool spans" },
+	{ "python-marker-library", OPT_PYTHON_MARKER_LIBRARY, "PATH", 0, "Path to AgentSight's native tool marker library" },
+	{ "python-asyncio-lib", OPT_PYTHON_ASYNCIO_PATH, "PATH", 0, "Path to the target process _asyncio extension" },
+	{ "python-runtime", OPT_PYTHON_RUNTIME_PATH, "PATH", 0, "Path to the target Python runtime binary or library" },
+	{ "python-task-step-offset", OPT_PYTHON_TASK_STEP_OFFSET, "OFFSET", 0, "_asyncio task step implementation file offset" },
+	{ "python-task-init-offset", OPT_PYTHON_TASK_INIT_OFFSET, "OFFSET", 0, "_asyncio task init file offset" },
+	{ "python-context-copy-offset", OPT_PYTHON_CONTEXT_COPY_OFFSET, "OFFSET", 0, "PyContext_CopyCurrent file offset" },
+	{ "python-context-run-offset", OPT_PYTHON_CONTEXT_RUN_OFFSET, "OFFSET", 0, "context_run file offset" },
 	{},
 };
+
+static bool parse_offset_arg(const char *arg, unsigned long long *offset)
+{
+	char *end = NULL;
+
+	errno = 0;
+	unsigned long long parsed = strtoull(arg, &end, 0);
+	if (errno || end == arg || *end != '\0' || parsed == 0)
+		return false;
+	*offset = parsed;
+	return true;
+}
 
 static bool parse_seed_pid_arg(const char *arg, struct seed_pid *seed)
 {
@@ -210,7 +252,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		errno = 0;
 		env.min_duration_ms = strtol(arg, NULL, 10);
 		if (errno || env.min_duration_ms <= 0) {
-			fprintf(stderr, "Invalid duration: %s\n", arg);
+			as_output_diagnostic("Invalid duration: %s\n", arg);
 			argp_usage(state);
 		}
 		break;
@@ -218,7 +260,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		errno = 0;
 		env.pid = (pid_t)strtol(arg, NULL, 10);
 		if (errno || env.pid <= 0) {
-			fprintf(stderr, "Invalid PID: %s\n", arg);
+			as_output_diagnostic("Invalid PID: %s\n", arg);
 			argp_usage(state);
 		}
 		env.filter_mode = FILTER_MODE_FILTER;
@@ -227,7 +269,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		errno = 0;
 		env.session_id = (pid_t)strtol(arg, NULL, 10);
 		if (errno || env.session_id <= 0) {
-			fprintf(stderr, "Invalid session id: %s\n", arg);
+			as_output_diagnostic("Invalid session id: %s\n", arg);
 			argp_usage(state);
 		}
 		env.filter_mode = FILTER_MODE_FILTER;
@@ -239,7 +281,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		errno = 0;
 		int mode = strtol(arg, NULL, 10);
 		if (errno || mode < 0 || mode > 2) {
-			fprintf(stderr, "Invalid filter mode: %s (must be 0, 1, or 2)\n", arg);
+			as_output_diagnostic("Invalid filter mode: %s (must be 0, 1, or 2)\n", arg);
 			argp_usage(state);
 		}
 		env.filter_mode = (enum filter_mode)mode;
@@ -249,7 +291,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		/* Parse comma-separated command list */
 		char *arg_copy = strdup(arg);
 		if (!arg_copy) {
-			fprintf(stderr, "Memory allocation failed\n");
+			as_output_diagnostic("Memory allocation failed\n");
 			return ARGP_ERR_UNKNOWN;
 		}
 		
@@ -264,7 +306,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			if (strlen(token) > 0) {
 				env.command_list[env.command_count] = strdup(token);
 				if (!env.command_list[env.command_count]) {
-					fprintf(stderr, "Memory allocation failed\n");
+					as_output_diagnostic("Memory allocation failed\n");
 					free(arg_copy);
 					return ARGP_ERR_UNKNOWN;
 				}
@@ -305,11 +347,11 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case OPT_SEED_PID:
 		if (env.seed_count >= MAX_SEED_PIDS) {
-			fprintf(stderr, "Too many --seed-pid entries (max %d)\n", MAX_SEED_PIDS);
+			as_output_diagnostic("Too many --seed-pid entries (max %d)\n", MAX_SEED_PIDS);
 			argp_usage(state);
 		}
 		if (!parse_seed_pid_arg(arg, &env.seed_pids[env.seed_count])) {
-			fprintf(stderr, "Invalid seed pid: %s\n", arg);
+			as_output_diagnostic("Invalid seed pid: %s\n", arg);
 			argp_usage(state);
 		}
 		env.seed_count++;
@@ -320,7 +362,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		errno = 0;
 		seconds = strtoul(arg, &end, 10);
 		if (errno || !end || *end || seconds == 0 || seconds > 86400) {
-			fprintf(stderr, "Invalid heartbeat interval: %s\n", arg);
+			as_output_diagnostic("Invalid heartbeat interval: %s\n", arg);
 			argp_usage(state);
 		}
 		env.heartbeat_seconds = (unsigned)seconds;
@@ -335,6 +377,46 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		env.pidns_pid = (pid_t)pid;
 		break;
 	}
+	case OPT_PYTHON_ASYNC_CONTEXT:
+		env.trace_python_async_context = true;
+		break;
+	case OPT_PYTHON_MARKER_LIBRARY:
+		if (!arg || arg[0] != '/' || strlen(arg) >= sizeof(env.python_marker_library)) {
+			as_output_diagnostic("Invalid absolute AgentSight marker library path: %s\n", arg);
+			argp_usage(state);
+		}
+		strncpy(env.python_marker_library, arg, sizeof(env.python_marker_library) - 1);
+		break;
+	case OPT_PYTHON_ASYNCIO_PATH:
+		if (!arg || arg[0] != '/' || strlen(arg) >= sizeof(env.python_asyncio_path)) {
+			as_output_diagnostic("Invalid absolute _asyncio path: %s\n", arg);
+			argp_usage(state);
+		}
+		strncpy(env.python_asyncio_path, arg, sizeof(env.python_asyncio_path) - 1);
+		break;
+	case OPT_PYTHON_RUNTIME_PATH:
+		if (!arg || arg[0] != '/' || strlen(arg) >= sizeof(env.python_runtime_path)) {
+			as_output_diagnostic("Invalid absolute Python runtime path: %s\n", arg);
+			argp_usage(state);
+		}
+		strncpy(env.python_runtime_path, arg, sizeof(env.python_runtime_path) - 1);
+		break;
+	case OPT_PYTHON_TASK_STEP_OFFSET:
+		if (!parse_offset_arg(arg, &env.python_task_step_offset))
+			argp_error(state, "Invalid Python task step offset: %s", arg);
+		break;
+	case OPT_PYTHON_TASK_INIT_OFFSET:
+		if (!parse_offset_arg(arg, &env.python_task_init_offset))
+			argp_error(state, "Invalid Python task init offset: %s", arg);
+		break;
+	case OPT_PYTHON_CONTEXT_COPY_OFFSET:
+		if (!parse_offset_arg(arg, &env.python_context_copy_offset))
+			argp_error(state, "Invalid Python context copy offset: %s", arg);
+		break;
+	case OPT_PYTHON_CONTEXT_RUN_OFFSET:
+		if (!parse_offset_arg(arg, &env.python_context_run_offset))
+			argp_error(state, "Invalid Python context run offset: %s", arg);
+		break;
 	case ARGP_KEY_ARG:
 		argp_usage(state);
 		break;
@@ -350,14 +432,18 @@ static const struct argp argp = {
 	.doc = argp_program_doc,
 };
 
+#endif /* !AGENTSIGHT_LIBRARY */
+
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
 	if (level == LIBBPF_DEBUG && !env.verbose)
 		return 0;
-	return vfprintf(stderr, format, args);
+	char message[2048];
+	vsnprintf(message, sizeof(message), format, args);
+	return as_output_diagnostic("%s", message);
 }
 
-static volatile bool exiting = false;
+static volatile sig_atomic_t exiting = false;
 
 static bool process_in_target_session(pid_t pid)
 {
@@ -439,11 +525,11 @@ static void report_file_open_drops(void)
 			struct timespec now = {};
 			clock_gettime(CLOCK_BOOTTIME, &now);
 			uint64_t timestamp_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
-			printf("{\"timestamp\":%llu,\"event\":\"FILE_OPEN_LOST\","
+			as_output_printf("{\"timestamp\":%llu,\"event\":\"FILE_OPEN_LOST\","
 			       "\"pid\":0,\"comm\":\"process\",\"count\":%llu}\n",
 				(unsigned long long)timestamp_ns,
 				(unsigned long long)(total - g_file_open_drops_reported));
-			fflush(stdout);
+			as_output_flush();
 			g_file_open_drops_reported = total;
 		}
 	}
@@ -454,13 +540,37 @@ static void report_file_open_drops(void)
 
 static void configure_optional_programs(struct process_bpf *skel)
 {
-	SET_AUTOLOAD(trace_unlinkat, env.trace_fs);
+#if defined(__aarch64__)
+	/* arm64 exposes the *at variants, but not these legacy tracepoints. */
+	SET_AUTOLOAD(trace_open, false);
+	SET_AUTOLOAD(trace_open_exit, false);
+	SET_AUTOLOAD(trace_unlink, false);
+	SET_AUTOLOAD(trace_rename, false);
+	SET_AUTOLOAD(trace_rename_exit, false);
+	SET_AUTOLOAD(trace_mkdir, false);
+	SET_AUTOLOAD(trace_dup2_enter, false);
+	SET_AUTOLOAD(trace_dup2_exit, false);
+#else
+	SET_AUTOLOAD(trace_open_exit, env.trace_fs);
 	SET_AUTOLOAD(trace_unlink, env.trace_fs);
+	SET_AUTOLOAD(trace_rename, env.trace_fs);
+	SET_AUTOLOAD(trace_rename_exit, env.trace_fs);
+	SET_AUTOLOAD(trace_mkdir, env.trace_fs);
+	SET_AUTOLOAD(trace_dup2_enter, env.trace_fs);
+	SET_AUTOLOAD(trace_dup2_exit, env.trace_fs);
+#endif
+	SET_AUTOLOAD(trace_openat_exit, env.trace_fs);
+	SET_AUTOLOAD(trace_close, env.trace_fs);
+	SET_AUTOLOAD(trace_dup_enter, env.trace_fs);
+	SET_AUTOLOAD(trace_dup_exit, env.trace_fs);
+	SET_AUTOLOAD(trace_dup3_enter, env.trace_fs);
+	SET_AUTOLOAD(trace_dup3_exit, env.trace_fs);
+	SET_AUTOLOAD(trace_unlinkat, env.trace_fs);
 	SET_AUTOLOAD(trace_renameat2, env.trace_fs);
 	SET_AUTOLOAD(trace_renameat, env.trace_fs);
-	SET_AUTOLOAD(trace_rename, env.trace_fs);
+	SET_AUTOLOAD(trace_renameat_exit, env.trace_fs);
+	SET_AUTOLOAD(trace_renameat2_exit, env.trace_fs);
 	SET_AUTOLOAD(trace_mkdirat, env.trace_fs);
-	SET_AUTOLOAD(trace_mkdir, env.trace_fs);
 	SET_AUTOLOAD(trace_ftruncate, env.trace_fs);
 	SET_AUTOLOAD(trace_chdir, env.trace_fs);
 	SET_AUTOLOAD(trace_write_enter, env.trace_fs);
@@ -488,10 +598,31 @@ static void configure_optional_programs(struct process_bpf *skel)
 	SET_AUTOLOAD(trace_setpgid, env.trace_signals);
 	SET_AUTOLOAD(trace_setsid, env.trace_signals);
 	SET_AUTOLOAD(trace_kill, env.trace_signals);
-	SET_AUTOLOAD(trace_fork, env.trace_signals);
+	SET_AUTOLOAD(trace_fork, env.trace_signals || env.trace_python_async_context);
 
 	SET_AUTOLOAD(trace_mmap, env.trace_mem);
 	SET_AUTOLOAD(trace_cow_fault, env.trace_cow);
+
+	SET_AUTOLOAD(python_task_step_enter, env.trace_python_async_context);
+	SET_AUTOLOAD(python_task_step_exit, env.trace_python_async_context);
+	SET_AUTOLOAD(python_task_init_enter, env.trace_python_async_context);
+	SET_AUTOLOAD(python_copy_context_enter, env.trace_python_async_context);
+	SET_AUTOLOAD(python_copy_context_exit, env.trace_python_async_context);
+	SET_AUTOLOAD(python_context_run_enter, env.trace_python_async_context);
+	SET_AUTOLOAD(python_context_run_exit, env.trace_python_async_context);
+	SET_AUTOLOAD(python_tool_context_bind, env.trace_python_async_context);
+	SET_AUTOLOAD(python_tool_context_unbind, env.trace_python_async_context);
+	if (env.trace_python_async_context) {
+		bpf_program__set_autoattach(skel->progs.python_task_step_enter, false);
+		bpf_program__set_autoattach(skel->progs.python_task_step_exit, false);
+		bpf_program__set_autoattach(skel->progs.python_task_init_enter, false);
+		bpf_program__set_autoattach(skel->progs.python_copy_context_enter, false);
+		bpf_program__set_autoattach(skel->progs.python_copy_context_exit, false);
+		bpf_program__set_autoattach(skel->progs.python_context_run_enter, false);
+		bpf_program__set_autoattach(skel->progs.python_context_run_exit, false);
+		bpf_program__set_autoattach(skel->progs.python_tool_context_bind, false);
+		bpf_program__set_autoattach(skel->progs.python_tool_context_unbind, false);
+	}
 }
 
 #undef SET_AUTOLOAD
@@ -503,7 +634,9 @@ static void configure_process_skel(struct process_bpf *skel, bool resolved_opens
 	configure_optional_programs(skel);
 	bpf_program__set_autoload(skel->progs.trace_file_open_exit, resolved_opens);
 	bpf_program__set_autoload(skel->progs.trace_openat, !resolved_opens);
+#if !defined(__aarch64__)
 	bpf_program__set_autoload(skel->progs.trace_open, !resolved_opens);
+#endif
 	skel->rodata->min_duration_ns = env.min_duration_ms * 1000000ULL;
 	skel->rodata->trace_fs_mutations = env.trace_fs;
 	skel->rodata->trace_network = env.trace_net;
@@ -516,6 +649,77 @@ static void configure_process_skel(struct process_bpf *skel, bool resolved_opens
 	skel->rodata->target_cgroup_id = cgroup_filter_id;
 	skel->rodata->target_pidns_dev = env.pidns_dev;
 	skel->rodata->target_pidns_ino = env.pidns_ino;
+	skel->rodata->trace_python_async_context = env.trace_python_async_context;
+}
+
+static int attach_python_async_uprobes(struct process_bpf *skel)
+{
+	pid_t attach_pid = env.pid > 0 ? env.pid : -1;
+	long link_error;
+
+#define ATTACH_PYTHON_UPROBE(link_name, program_name, retprobe, path, offset) do { \
+		skel->links.link_name = bpf_program__attach_uprobe( \
+			skel->progs.program_name, retprobe, attach_pid, path, offset); \
+		link_error = libbpf_get_error(skel->links.link_name); \
+		if (link_error) { \
+			skel->links.link_name = NULL; \
+			as_output_diagnostic("Failed to attach %s at %s+0x%llx: %s\n", \
+				#program_name, path, (unsigned long long)offset, strerror(-link_error)); \
+			return (int)link_error; \
+		} \
+	} while (0)
+
+	ATTACH_PYTHON_UPROBE(
+		python_task_step_enter, python_task_step_enter, false,
+		env.python_asyncio_path, env.python_task_step_offset);
+	ATTACH_PYTHON_UPROBE(
+		python_task_step_exit, python_task_step_exit, true,
+		env.python_asyncio_path, env.python_task_step_offset);
+	ATTACH_PYTHON_UPROBE(
+		python_task_init_enter, python_task_init_enter, false,
+		env.python_asyncio_path, env.python_task_init_offset);
+	ATTACH_PYTHON_UPROBE(
+		python_copy_context_enter, python_copy_context_enter, false,
+		env.python_runtime_path, env.python_context_copy_offset);
+	ATTACH_PYTHON_UPROBE(
+		python_copy_context_exit, python_copy_context_exit, true,
+		env.python_runtime_path, env.python_context_copy_offset);
+	ATTACH_PYTHON_UPROBE(
+		python_context_run_enter, python_context_run_enter, false,
+		env.python_runtime_path, env.python_context_run_offset);
+	ATTACH_PYTHON_UPROBE(
+		python_context_run_exit, python_context_run_exit, true,
+		env.python_runtime_path, env.python_context_run_offset);
+
+#undef ATTACH_PYTHON_UPROBE
+
+#define ATTACH_MARKER_UPROBE(link_name, program_name, symbol_name) do { \
+		LIBBPF_OPTS(bpf_uprobe_opts, marker_opts, \
+			.func_name = symbol_name, .retprobe = false); \
+		skel->links.link_name = bpf_program__attach_uprobe_opts( \
+			skel->progs.program_name, attach_pid, env.python_marker_library, 0, \
+			&marker_opts); \
+		link_error = libbpf_get_error(skel->links.link_name); \
+		if (link_error) { \
+			skel->links.link_name = NULL; \
+			as_output_diagnostic("Failed to attach %s at %s:%s: %s\n", \
+				#program_name, env.python_marker_library, symbol_name, \
+				strerror(-link_error)); \
+			return (int)link_error; \
+		} \
+	} while (0)
+
+	ATTACH_MARKER_UPROBE(
+		python_tool_context_bind,
+		python_tool_context_bind,
+		"agentsight_tool_context_bind");
+	ATTACH_MARKER_UPROBE(
+		python_tool_context_unbind,
+		python_tool_context_unbind,
+		"agentsight_tool_context_unbind");
+
+#undef ATTACH_MARKER_UPROBE
+	return 0;
 }
 
 // Rate limiting check function
@@ -627,24 +831,24 @@ static void print_file_open_event(const struct event *e, uint64_t timestamp_ns, 
 	json_escape_field(e->comm, comm_esc, sizeof(comm_esc));
 	invalid_path = escape_file_path(e->file_op.filepath, filepath_esc, sizeof(filepath_esc));
 
-	printf("{");
-	printf("\"timestamp\":%llu,", (unsigned long long)timestamp_ns);
-	printf("\"event\":\"FILE_OPEN\",");
-	printf("\"comm\":\"%s\",", comm_esc);
-	printf("\"pid\":%d,", e->pid);
-	printf("\"count\":%u,", count);
-	printf("\"filepath\":\"%s\",", filepath_esc);
+	as_output_printf("{");
+	as_output_printf("\"timestamp\":%llu,", (unsigned long long)timestamp_ns);
+	as_output_printf("\"event\":\"FILE_OPEN\",");
+	as_output_printf("\"comm\":\"%s\",", comm_esc);
+	as_output_printf("\"pid\":%d,", e->pid);
+	as_output_printf("\"count\":%u,", count);
+	as_output_printf("\"filepath\":\"%s\",", filepath_esc);
 	if (invalid_path) {
 		static const char hex[] = "0123456789abcdef";
 		const unsigned char *path = (const unsigned char *)e->file_op.filepath;
-		printf("\"filepath_hex\":\"");
+		as_output_printf("\"filepath_hex\":\"");
 		for (size_t i = 0, len = strnlen(e->file_op.filepath, MAX_FILE_PATH_LEN); i < len; i++)
-			printf("%c%c", hex[path[i] >> 4], hex[path[i] & 15]);
-		printf("\",");
+			as_output_printf("%c%c", hex[path[i] >> 4], hex[path[i] & 15]);
+		as_output_printf("\",");
 	}
-	printf("\"flags\":%d", e->file_op.flags);
+	as_output_printf("\"flags\":%d", e->file_op.flags);
 	if (e->file_op.resolved) {
-		printf(",\"read\":%s,\"write\":%s,\"exec\":%s,\"layer\":%s,"
+		as_output_printf(",\"read\":%s,\"write\":%s,\"exec\":%s,\"layer\":%s,"
 		       "\"dev\":%u,\"dev_maj_min\":\"%u:%u\",\"ino\":%llu",
 		       e->file_op.access & FILE_ACCESS_READ ? "true" : "false",
 		       e->file_op.access & FILE_ACCESS_WRITE ? "true" : "false",
@@ -652,17 +856,18 @@ static void print_file_open_event(const struct event *e, uint64_t timestamp_ns, 
 		       e->file_op.layer ? "true" : "false",
 		       e->file_op.dev, major(e->file_op.dev), minor(e->file_op.dev), e->file_op.ino);
 		if (e->file_op.path_error)
-			printf(",\"path_error\":%d", e->file_op.path_error);
+			as_output_printf(",\"path_error\":%d", e->file_op.path_error);
 	}
+	print_python_async_context(e);
 	
 	if (extra_fields && strlen(extra_fields) > 0) {
-		printf(",%s", extra_fields);
+		as_output_printf(",%s", extra_fields);
 	}
 
 	print_container_fields(e->pid);
 
-	printf("}\n");
-	fflush(stdout);
+	as_output_printf("}\n");
+	as_output_flush();
 }
 
 
@@ -696,6 +901,10 @@ static uint32_t get_file_open_count(const struct event *e, uint64_t timestamp_ns
 	
 	// Initialize warning message
 	warning_msg[0] = '\0';
+
+	/* Exact tool attribution is more important than path aggregation. */
+	if (e->correlation_source != ASYNC_CORRELATION_NONE)
+		return 1;
 	
 	// Rate limiting check
 	bool add_warning = false;
@@ -716,7 +925,7 @@ static uint32_t get_file_open_count(const struct event *e, uint64_t timestamp_ns
 			// Print aggregated result if count > 1
 			if (file_hashes[i].count > 1) {
 				if (env.verbose) {
-					fprintf(stderr, "DEBUG: Aggregation window expired for FILE_OPEN, count=%u\n", 
+					as_output_diagnostic("DEBUG: Aggregation window expired for FILE_OPEN, count=%u\n",
 						file_hashes[i].count);
 				}
 				// Create fake event structure for aggregated output
@@ -753,7 +962,7 @@ static uint32_t get_file_open_count(const struct event *e, uint64_t timestamp_ns
 			file_hashes[i].count++;
 			file_hashes[i].timestamp_ns = timestamp_ns;
 			if (env.verbose) {
-				fprintf(stderr, "DEBUG: Aggregating FILE_OPEN for PID %d, count now %u\n", 
+				as_output_diagnostic("DEBUG: Aggregating FILE_OPEN for PID %d, count now %u\n",
 					e->pid, file_hashes[i].count);
 			}
 			return 0;  // Return 0 to indicate this should be skipped (duplicate)
@@ -773,11 +982,11 @@ static uint32_t get_file_open_count(const struct event *e, uint64_t timestamp_ns
 		file_hashes[hash_count].flags = e->file_op.flags;
 		hash_count++;
 		if (env.verbose) {
-			fprintf(stderr, "DEBUG: Created new aggregation entry for FILE_OPEN, PID %d (total entries: %d)\n", 
+			as_output_diagnostic("DEBUG: Created new aggregation entry for FILE_OPEN, PID %d (total entries: %d)\n",
 				e->pid, hash_count);
 		}
 	} else if (env.verbose) {
-		fprintf(stderr, "DEBUG: Max aggregation entries reached (%d), cannot track more\n", MAX_FILE_HASHES);
+		as_output_diagnostic("DEBUG: Max aggregation entries reached (%d), cannot track more\n", MAX_FILE_HASHES);
 		// just print the event
 		print_file_open_event(e, timestamp_ns, 1, NULL);
 	}
@@ -792,7 +1001,7 @@ static void flush_pid_file_opens(pid_t pid, uint64_t timestamp_ns)
 	for (int i = 0; i < hash_count; i++) {
 		if (file_hashes[i].pid == pid && file_hashes[i].count > 1) {
 			if (env.verbose) {
-				fprintf(stderr, "DEBUG: Flushing FILE_OPEN aggregation on process exit, PID %d, count=%u\n", 
+				as_output_diagnostic("DEBUG: Flushing FILE_OPEN aggregation on process exit, PID %d, count=%u\n",
 					pid, file_hashes[i].count);
 			}
 			// Create fake event structure for aggregated output
@@ -831,7 +1040,7 @@ static void flush_pid_file_opens(pid_t pid, uint64_t timestamp_ns)
 	}
 	
 	if (env.verbose && removed_count > 0) {
-		fprintf(stderr, "DEBUG: Cleared %d FILE_OPEN aggregation entries for PID %d (flushed %d)\n", 
+		as_output_diagnostic("DEBUG: Cleared %d FILE_OPEN aggregation entries for PID %d (flushed %d)\n",
 			removed_count, pid, flushed_count);
 	}
 }
@@ -847,18 +1056,19 @@ static void print_exec_event(const struct event *e)
 	json_escape_field(e->filename, filename_esc, sizeof(filename_esc));
 	json_escape_field(full_command, command_esc, sizeof(command_esc));
 
-	printf("{");
-	printf("\"timestamp\":%llu,", e->timestamp_ns);
-	printf("\"event\":\"EXEC\",");
-	printf("\"comm\":\"%s\",", comm_esc);
-	printf("\"pid\":%d,", e->pid);
-	printf("\"ppid\":%d", e->ppid);
-	printf(",\"filename\":\"%s\"", filename_esc);
-	printf(",\"full_command\":\"%s\"", command_esc);
+	as_output_printf("{");
+	as_output_printf("\"timestamp\":%llu,", e->timestamp_ns);
+	as_output_printf("\"event\":\"EXEC\",");
+	as_output_printf("\"comm\":\"%s\",", comm_esc);
+	as_output_printf("\"pid\":%d,", e->pid);
+	as_output_printf("\"ppid\":%d", e->ppid);
+	as_output_printf(",\"filename\":\"%s\"", filename_esc);
+	as_output_printf(",\"full_command\":\"%s\"", command_esc);
+	print_python_async_context(e);
 
 	print_container_fields(e->pid);
-	printf("}\n");
-	fflush(stdout);
+	as_output_printf("}\n");
+	as_output_flush();
 }
 
 static void print_exit_event(const struct event *e)
@@ -867,29 +1077,29 @@ static void print_exit_event(const struct event *e)
 
 	json_escape_field(e->comm, comm_esc, sizeof(comm_esc));
 
-	printf("{");
-	printf("\"timestamp\":%llu,", e->timestamp_ns);
-	printf("\"event\":\"EXIT\",");
-	printf("\"comm\":\"%s\",", comm_esc);
-	printf("\"pid\":%d,", e->pid);
-	printf("\"ppid\":%d", e->ppid);
-	printf(",\"exit_code\":%u", e->exit_code);
+	as_output_printf("{");
+	as_output_printf("\"timestamp\":%llu,", e->timestamp_ns);
+	as_output_printf("\"event\":\"EXIT\",");
+	as_output_printf("\"comm\":\"%s\",", comm_esc);
+	as_output_printf("\"pid\":%d,", e->pid);
+	as_output_printf("\"ppid\":%d", e->ppid);
+	as_output_printf(",\"exit_code\":%u", e->exit_code);
 	if (e->duration_ns)
-		printf(",\"duration_ms\":%llu", e->duration_ns / 1000000);
+		as_output_printf(",\"duration_ms\":%llu", e->duration_ns / 1000000);
 
 	if (g_exit_mem_fd >= 0) {
 		uint32_t mem_pid = (uint32_t)e->pid;
 		struct exit_mem_info emem = {};
 		if (bpf_map_lookup_elem(g_exit_mem_fd, &mem_pid, &emem) == 0) {
-			printf(",\"vm_hwm_kb\":%llu",
+			as_output_printf(",\"vm_hwm_kb\":%llu",
 			       (unsigned long long)(emem.hiwater_rss * page_size_kb));
 			bpf_map_delete_elem(g_exit_mem_fd, &mem_pid);
 		}
 	}
 
 	print_container_fields(e->pid);
-	printf("}\n");
-	fflush(stdout);
+	as_output_printf("}\n");
+	as_output_flush();
 }
 
 static void print_bash_readline_event(const struct event *e)
@@ -900,15 +1110,15 @@ static void print_bash_readline_event(const struct event *e)
 	json_escape_field(e->comm, comm_esc, sizeof(comm_esc));
 	json_escape_field(e->command, command_esc, sizeof(command_esc));
 
-	printf("{");
-	printf("\"timestamp\":%llu,", e->timestamp_ns);
-	printf("\"event\":\"BASH_READLINE\",");
-	printf("\"comm\":\"%s\",", comm_esc);
-	printf("\"pid\":%d,", e->pid);
-	printf("\"command\":\"%s\"", command_esc);
+	as_output_printf("{");
+	as_output_printf("\"timestamp\":%llu,", e->timestamp_ns);
+	as_output_printf("\"event\":\"BASH_READLINE\",");
+	as_output_printf("\"comm\":\"%s\",", comm_esc);
+	as_output_printf("\"pid\":%d,", e->pid);
+	as_output_printf("\"command\":\"%s\"", command_esc);
 	print_container_fields(e->pid);
-	printf("}\n");
-	fflush(stdout);
+	as_output_printf("}\n");
+	as_output_flush();
 }
 
 static void sig_handler(int sig)
@@ -931,7 +1141,7 @@ static int seed_initial_pids(struct pid_tracker *tracker)
 				tracked_count++;
 			}
 		} else if (env.verbose) {
-			fprintf(stderr, "Warning: Failed to add seeded PID %d to tracker (table full)\n", pid);
+			as_output_diagnostic("Warning: Failed to add seeded PID %d to tracker (table full)\n", pid);
 		}
 	}
 
@@ -940,6 +1150,11 @@ static int seed_initial_pids(struct pid_tracker *tracker)
 
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
+	if (!data || data_sz < sizeof(struct event)) {
+		if (as_output_sink)
+			as_output_sink(as_output_context, 2, "short BPF event", 15);
+		return 0;
+	}
 	const struct event *e = data;
 	struct pid_tracker *tracker = (struct pid_tracker *)ctx;
 
@@ -971,18 +1186,22 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 
 				print_exit_event(e);
 				if (add_warning) {
-					printf("{\"timestamp\":%llu,\"event\":\"WARNING\","
+					as_output_printf("{\"timestamp\":%llu,\"event\":\"WARNING\","
 					       "\"comm\":\"\",\"pid\":%d,"
 					       "\"type\":\"FILE_RATE_LIMIT\","
 					       "\"message\":\"Process had %d+ file ops per second\"}\n",
 					       e->timestamp_ns, e->pid, MAX_DISTINCT_FILES_PER_SEC);
-					fflush(stdout);
+					as_output_flush();
 				}
 
 			// Flush all pending FILE_OPEN aggregations for this PID
 			flush_pid_file_opens(e->pid, e->timestamp_ns);
 			if (g_agg_map_fd >= 0)
 				flush_pid_from_agg_map(g_agg_map_fd, e->pid);
+			if (g_correlated_file_agg_map_fd >= 0)
+				flush_pid_from_correlated_file_agg_map(
+					g_correlated_file_agg_map_fd,
+					e->pid);
 		} else {
 			bool should_track = should_track_event_process(tracker, e->comm, e->pid, e->ppid);
 
@@ -1012,6 +1231,12 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 			print_bash_readline_event(e);
 			break;
 
+		case EVENT_TYPE_FILE_RENAME_RESULT:
+			/* Attribution was snapshotted in-kernel; never reassign or dedup. */
+			print_file_rename_json(e);
+			as_output_flush();
+			break;
+
 		case EVENT_TYPE_FILE_OPERATION:
 			// Only handle FILE_OPEN events, skip FILE_CLOSE
 			if (!e->file_op.is_open) {
@@ -1038,12 +1263,12 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 
 		default:
 			// For unknown events, always report immediately
-			printf("{");
-			printf("\"timestamp\":%llu,", e->timestamp_ns);
-			printf("\"event\":\"UNKNOWN\",");
-			printf("\"event_type\":%d", e->type);
-			printf("}\n");
-			fflush(stdout);
+			as_output_printf("{");
+			as_output_printf("\"timestamp\":%llu,", e->timestamp_ns);
+			as_output_printf("\"event\":\"UNKNOWN\",");
+			as_output_printf("\"event_type\":%d", e->type);
+			as_output_printf("}\n");
+			as_output_flush();
 			break;
 	}
 
@@ -1056,70 +1281,72 @@ static void print_probe_liveness(const char *kind)
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0 ||
 	    clock_gettime(CLOCK_REALTIME, &wall) != 0)
 		return;
-	printf("{\"event\":\"PROBE_LIVENESS\",\"kind\":\"%s\","
+	as_output_printf("{\"event\":\"PROBE_LIVENESS\",\"kind\":\"%s\","
 	       "\"pid\":0,\"comm\":\"process\",\"timestamp\":%llu,"
 	       "\"wall_time_ns\":%llu,\"every\":%u",
 	       kind, (unsigned long long)ts.tv_sec * 1000000000ULL + ts.tv_nsec,
 	       (unsigned long long)wall.tv_sec * 1000000000ULL + wall.tv_nsec,
 	       env.heartbeat_seconds);
 	if (kind[0] == 's')
-		printf(",\"trace_fs\":%s,\"trace_net\":%s,\"trace_signals\":%s,"
+		as_output_printf(",\"trace_fs\":%s,\"trace_net\":%s,\"trace_signals\":%s,"
 		       "\"trace_mem\":%s,\"trace_cow\":%s",
 		       env.trace_fs ? "true" : "false", env.trace_net ? "true" : "false",
 		       env.trace_signals ? "true" : "false", env.trace_mem ? "true" : "false",
 		       env.trace_cow ? "true" : "false");
-	printf("}\n");
-	fflush(stdout);
+	as_output_printf("}\n");
+	as_output_flush();
 }
 
-int main(int argc, char **argv)
+
+/* Both the CLI and the private library entrypoints use this loader. The Rust
+ * wrapper serializes core calls and owns the single-active-instance guard. */
+static struct process_bpf *active_skel;
+static struct ring_buffer *active_rb;
+static uint64_t core_last_flush;
+static uint64_t core_last_cgroup_refresh;
+static uint64_t core_last_heartbeat;
+static int core_pidns_fd = -1;
+
+static void core_reset_fds(void)
 {
-	struct ring_buffer *rb = NULL;
+	if (core_pidns_fd >= 0)
+		close(core_pidns_fd);
+	core_pidns_fd = -1;
+	g_file_open_dropped_fd = g_file_open_prog_fd = -1;
+	g_file_open_drops_reported = 0;
+	g_agg_map_fd = g_correlated_file_agg_map_fd = g_tracked_pids_fd = -1;
+	g_tracked_cgroups_fd = g_overflow_fd = g_exit_mem_fd = -1;
+}
+
+static int core_load(void)
+{
 	struct process_bpf *skel;
+	struct ring_buffer *rb = NULL;
 	int err;
-	int pidns_fd = -1;
-
-	/* Parse command line arguments */
-	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
-	if (err)
-		return err;
-	if (env.cgroup_filter_children && !env.cgroup_filter_enabled) {
-		fprintf(stderr, "--cgroup-filter-children requires --cgroup-filter <path>\n");
-		return 1;
-	}
-
-	/* filter_mode is set via -m flag or -a flag, defaults to FILTER_MODE_PROC */
 	page_size_kb = sysconf(_SC_PAGESIZE) / 1024;
 	if (page_size_kb <= 0)
 		page_size_kb = 4;
-
-	/* Initialize userspace PID tracker */
 	pid_tracker_init(&pid_tracker, env.command_list, env.command_count, env.filter_mode, env.pid);
-
-	/* Set up libbpf errors and debug info callback */
-	libbpf_set_print(libbpf_print_fn);
-
-	/* Cleaner handling of Ctrl-C */
-	signal(SIGINT, sig_handler);
-	signal(SIGTERM, sig_handler);
-
+	hash_count = pid_limit_count = 0;
+	core_reset_fds();
 	/* Load and verify BPF application */
 	skel = process_bpf__open();
 	if (!skel) {
-		fprintf(stderr, "Failed to open and load BPF skeleton\n");
-		return 1;
+		as_output_diagnostic("Failed to open and load BPF skeleton\n");
+		return errno ? -errno : -ENOMEM;
 	}
 
-	bool resolved_opens = can_trace_resolved_opens();
+	/* Enhancement needs every open and syscall entry FD bookkeeping. */
+	bool resolved_opens = !env.trace_python_async_context && can_trace_resolved_opens();
 	if (env.pidns_pid) {
 		char path[64];
 		struct stat st;
 		snprintf(path, sizeof(path), "/proc/%d/ns/pid", env.pidns_pid);
 		/* Pin the namespace so an exiting target cannot cause inode reuse. */
-		pidns_fd = open(path, O_RDONLY | O_CLOEXEC);
-		if (pidns_fd < 0 || fstat(pidns_fd, &st) != 0) {
+		core_pidns_fd = open(path, O_RDONLY | O_CLOEXEC);
+		if (core_pidns_fd < 0 || fstat(core_pidns_fd, &st) != 0) {
 			err = -errno;
-			fprintf(stderr, "Failed to open PID namespace %s: %s\n", path, strerror(-err));
+			as_output_diagnostic("Failed to open PID namespace %s: %s\n", path, strerror(-err));
 			goto cleanup;
 		}
 		env.pidns_dev = st.st_dev;
@@ -1132,7 +1359,7 @@ int main(int argc, char **argv)
 	uint64_t cgroup_filter_id = 0;
 	if (env.cgroup_filter_enabled) {
 		if (!resolve_cgroup_id_from_path(env.cgroup_filter_path, &cgroup_filter_id)) {
-			fprintf(stderr, "Failed to resolve cgroup filter path: %s\n",
+			as_output_diagnostic("Failed to resolve cgroup filter path: %s\n",
 			        env.cgroup_filter_path);
 			err = -EINVAL;
 			goto cleanup;
@@ -1145,7 +1372,7 @@ int main(int argc, char **argv)
 	/* Load & verify BPF programs */
 	err = process_bpf__load(skel);
 	if (err && resolved_opens) {
-		fprintf(stderr, "process: resolved file hook failed to load; using syscall fallback\n");
+		as_output_diagnostic("process: resolved file hook failed to load; using syscall fallback\n");
 		process_bpf__destroy(skel);
 		skel = process_bpf__open();
 		if (!skel) {
@@ -1156,15 +1383,17 @@ int main(int argc, char **argv)
 		configure_process_skel(skel, resolved_opens, need_pid_filter,
 				       need_cgroup_filter, cgroup_filter_id);
 		err = process_bpf__load(skel);
-	} else if (!resolved_opens) {
-		fprintf(stderr, "process: resolved file opens unavailable; using syscall fallback\n");
+	} else if (!resolved_opens && !env.trace_python_async_context) {
+		as_output_diagnostic("process: resolved file opens unavailable; using syscall fallback\n");
 	}
 	if (err) {
-		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
+		as_output_diagnostic("Failed to load and verify BPF skeleton\n");
 		goto cleanup;
 	}
 
 	g_agg_map_fd = bpf_map__fd(skel->maps.event_agg_map);
+	g_correlated_file_agg_map_fd =
+		bpf_map__fd(skel->maps.correlated_file_agg_map);
 	g_tracked_pids_fd = bpf_map__fd(skel->maps.tracked_pids);
 	g_tracked_cgroups_fd = bpf_map__fd(skel->maps.tracked_cgroups);
 	g_overflow_fd = bpf_map__fd(skel->maps.agg_overflow_count);
@@ -1177,20 +1406,20 @@ int main(int argc, char **argv)
 	if (need_cgroup_filter && env.cgroup_filter_children) {
 		int cgroups = populate_cgroup_filter_map(env.cgroup_filter_path, true, g_tracked_cgroups_fd);
 		if (cgroups < 0) {
-			fprintf(stderr, "Failed to populate descendant cgroups from %s: %s\n",
+			as_output_diagnostic("Failed to populate descendant cgroups from %s: %s\n",
 			        env.cgroup_filter_path, strerror(-cgroups));
 			err = cgroups;
 			goto cleanup;
 		}
 		if (env.verbose)
-			fprintf(stderr, "Loaded cgroup subtree filter entries: %d\n", cgroups);
+			as_output_diagnostic("Loaded cgroup subtree filter entries: %d\n", cgroups);
 	}
 
 	int tracked_count = seed_initial_pids(&pid_tracker);
 	
 	/* Output configuration as JSON */
 	if (env.verbose) {
-		fprintf(stderr, "Loaded process: trace_fs=%d trace_net=%d trace_signals=%d "
+		as_output_diagnostic("Loaded process: trace_fs=%d trace_net=%d trace_signals=%d "
 			"trace_mem=%d trace_cow=%d filter_pids=%d filter_cgroup=%d "
 			"filter_cgroup_children=%d cgroup_id=%llu seed_pids=%d seeded_tracked=%d\n",
 			env.trace_fs, env.trace_net, env.trace_signals,
@@ -1202,87 +1431,204 @@ int main(int argc, char **argv)
 	/* Attach tracepoints */
 	err = process_bpf__attach(skel);
 	if (err) {
-		fprintf(stderr, "Failed to attach BPF skeleton\n");
+		as_output_diagnostic("Failed to attach BPF skeleton\n");
 		goto cleanup;
+	}
+	if (env.trace_python_async_context) {
+		err = attach_python_async_uprobes(skel);
+		if (err)
+			goto cleanup;
 	}
 
 	/* Set up ring buffer polling with pid_tracker as context */
 	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, &pid_tracker, NULL);
 	if (!rb) {
-		err = -1;
-		fprintf(stderr, "Failed to create ring buffer\n");
+		err = errno ? -errno : -ENOMEM;
+		as_output_diagnostic("Failed to create ring buffer\n");
 		goto cleanup;
 	}
 
-	uint64_t last_flush_time = 0;
-	uint64_t last_cgroup_refresh_time = 0;
-	uint64_t last_heartbeat_time = (uint64_t)time(NULL);
+	active_skel = skel;
+	active_rb = rb;
+	core_last_flush = core_last_cgroup_refresh = core_last_heartbeat = 0;
+	struct timespec heartbeat_start;
+	if (clock_gettime(CLOCK_MONOTONIC, &heartbeat_start) == 0)
+		core_last_heartbeat = (uint64_t)heartbeat_start.tv_sec;
 	print_clock_sync_anchor("start");
 	if (env.heartbeat_seconds)
 		print_probe_liveness("start");
-
-	/* Process events */
-	while (!exiting) {
-		int poll_ms = POLL_TIMEOUT_MS;
-
-		err = ring_buffer__poll(rb, poll_ms);
-		report_file_open_drops();
-		/* Ctrl-C will cause -EINTR */
-		if (err == -EINTR) {
-			err = 0;
-			break;
-		}
-		if (err < 0) {
-			fprintf(stderr, "Error polling perf buffer: %d\n", err);
-			break;
-		}
-
-		uint64_t now = (uint64_t)time(NULL);
-		if (env.heartbeat_seconds && now - last_heartbeat_time >= env.heartbeat_seconds) {
-			print_probe_liveness("alive");
-			last_heartbeat_time = now;
-		}
-		if (need_cgroup_filter && env.cgroup_filter_children &&
-		    now - last_cgroup_refresh_time >= 2) {
-			int rc = populate_cgroup_filter_map(env.cgroup_filter_path, true, g_tracked_cgroups_fd);
-			if (rc < 0 && env.verbose) {
-				fprintf(stderr, "Warning: failed to refresh cgroup subtree map: %s\n",
-				        strerror(-rc));
-			}
-			last_cgroup_refresh_time = now;
-		}
-		if (now - last_flush_time >= FLUSH_INTERVAL_S) {
-			if (g_agg_map_fd >= 0)
-				flush_agg_map(g_agg_map_fd);
-			if (g_overflow_fd >= 0)
-				check_overflow(g_overflow_fd);
-			last_flush_time = now;
-		}
-
-	}
-
-	if (g_agg_map_fd >= 0)
-		flush_agg_map(g_agg_map_fd);
-	report_file_open_drops();
-	print_clock_sync_anchor("end");
-
+	return 0;
 cleanup:
-	/* Clean up */
-	if (pidns_fd >= 0)
-		close(pidns_fd);
 	ring_buffer__free(rb);
 	process_bpf__destroy(skel);
-	
-	/* Free allocated command strings */
-	for (int i = 0; i < env.command_count; i++) {
-		free(env.command_list[i]);
-	}
-	
-	/* Clean up FILE_OPEN deduplication tracking */
-	hash_count = 0;
-	
-	/* Clean up rate limiting tracking */
-	pid_limit_count = 0;
+	core_reset_fds();
+	return err;
+}
 
+static int core_poll(int timeout_ms, int wake_fd)
+{
+	int err;
+	if (wake_fd >= 0) {
+		struct pollfd fds[2] = {
+			{ .fd = ring_buffer__epoll_fd(active_rb), .events = POLLIN },
+			{ .fd = wake_fd, .events = POLLIN },
+		};
+		err = poll(fds, 2, timeout_ms);
+		if (err < 0)
+			return errno == EINTR ? 0 : -errno;
+		if (fds[1].revents)
+			return 0;
+		/* Bound each pass so a busy producer cannot starve stop/flush. */
+		err = ring_buffer__consume_n(active_rb, 4096);
+	} else {
+		err = ring_buffer__poll(active_rb, timeout_ms);
+	}
+	if (err == -EINTR)
+		return 0;
+	if (err < 0)
+		return err;
+	struct timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return -errno;
+	uint64_t now = (uint64_t)ts.tv_sec;
+	report_file_open_drops();
+	if (env.heartbeat_seconds && now - core_last_heartbeat >= env.heartbeat_seconds) {
+		print_probe_liveness("alive");
+		core_last_heartbeat = now;
+	}
+	if (env.cgroup_filter_enabled && env.cgroup_filter_children &&
+	    now - core_last_cgroup_refresh >= 2) {
+		int rc = populate_cgroup_filter_map(env.cgroup_filter_path, true, g_tracked_cgroups_fd);
+		if (rc < 0)
+			as_output_diagnostic("Failed to refresh cgroup subtree: %s\n", strerror(-rc));
+		core_last_cgroup_refresh = now;
+	}
+	if (now - core_last_flush >= FLUSH_INTERVAL_S) {
+		flush_agg_map(g_agg_map_fd);
+		flush_correlated_file_agg_map(g_correlated_file_agg_map_fd);
+		check_overflow(g_overflow_fd);
+		core_last_flush = now;
+	}
+	return 0;
+}
+
+static void core_close(void)
+{
+	if (!active_skel)
+		return;
+	/* Stop producers before draining. Context was already copied into records. */
+	process_bpf__detach(active_skel);
+	if (active_rb)
+		ring_buffer__consume(active_rb);
+	flush_agg_map(g_agg_map_fd);
+	flush_correlated_file_agg_map(g_correlated_file_agg_map_fd);
+	check_overflow(g_overflow_fd);
+	report_file_open_drops();
+	print_clock_sync_anchor("end");
+	ring_buffer__free(active_rb);
+	process_bpf__destroy(active_skel);
+	active_skel = NULL;
+	active_rb = NULL;
+	core_reset_fds();
+	hash_count = pid_limit_count = 0;
+}
+
+#ifdef AGENTSIGHT_LIBRARY
+int as_core_open(const struct as_core_config *cfg, as_core_output_fn output, void *context)
+{
+	static bool memlock_configured;
+	if (!cfg || !output || active_skel)
+		return -EINVAL;
+	if (!cfg->marker_path || !cfg->asyncio_path || !cfg->python_path ||
+	    cfg->pid < 0 || !cfg->task_step_offset || !cfg->task_init_offset ||
+	    !cfg->context_copy_offset || !cfg->context_run_offset)
+		return -EINVAL;
+	memset(&env, 0, sizeof(env));
+	as_output_set_sink(output, context);
+	/* libbpf is statically linked with hidden symbols, not the host's instance.
+	 * Never change the host's resource limits or signal handlers. */
+	if (!memlock_configured) {
+		int rc = libbpf_set_memlock_rlim(0);
+		if (rc)
+			return rc;
+		memlock_configured = true;
+	}
+	libbpf_set_print(libbpf_print_fn);
+	env.pid = cfg->pid;
+	env.filter_mode = cfg->pid > 0 ? FILTER_MODE_FILTER : FILTER_MODE_ALL;
+	env.trace_fs = true;
+	env.trace_python_async_context = true;
+#define COPY_CORE_PATH(field, value) do { \
+	if (!(value) || (value)[0] != '/' || strlen(value) >= sizeof(env.field)) \
+		return -EINVAL; \
+	strcpy(env.field, value); \
+} while (0)
+	COPY_CORE_PATH(python_marker_library, cfg->marker_path);
+	COPY_CORE_PATH(python_asyncio_path, cfg->asyncio_path);
+	COPY_CORE_PATH(python_runtime_path, cfg->python_path);
+	if (cfg->cgroup_path && cfg->cgroup_path[0]) {
+		COPY_CORE_PATH(cgroup_filter_path, cfg->cgroup_path);
+		env.cgroup_filter_enabled = true;
+		env.cgroup_filter_children = cfg->cgroup_children != 0;
+	}
+#undef COPY_CORE_PATH
+	if (env.pid <= 0 && !env.cgroup_filter_enabled)
+		return -EINVAL;
+	if (env.pid > 0) {
+		env.seed_pids[0] = (struct seed_pid){ .pid = env.pid };
+		env.seed_count = 1;
+	}
+	env.python_task_step_offset = cfg->task_step_offset;
+	env.python_task_init_offset = cfg->task_init_offset;
+	env.python_context_copy_offset = cfg->context_copy_offset;
+	env.python_context_run_offset = cfg->context_run_offset;
+	return core_load();
+}
+
+int as_core_poll(int timeout_ms, int wake_fd)
+{
+	return active_rb ? core_poll(timeout_ms, wake_fd) : -EINVAL;
+}
+
+void as_core_close(void)
+{
+	core_close();
+	as_output_set_sink(NULL, NULL);
+}
+#else
+int main(int argc, char **argv)
+{
+	int err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
+	if (err)
+		return err;
+	if (env.cgroup_filter_children && !env.cgroup_filter_enabled) {
+		as_output_diagnostic("--cgroup-filter-children requires --cgroup-filter <path>\n");
+		return 1;
+	}
+	if (env.trace_python_async_context &&
+	    (!env.python_marker_library[0] || !env.python_asyncio_path[0] ||
+	     !env.python_runtime_path[0] || !env.python_task_step_offset ||
+	     !env.python_task_init_offset || !env.python_context_copy_offset ||
+	     !env.python_context_run_offset)) {
+		as_output_diagnostic("--python-async-context requires the marker library, both Python paths, and all four offsets\n");
+		return 1;
+	}
+	libbpf_set_print(libbpf_print_fn);
+	signal(SIGINT, sig_handler);
+	signal(SIGTERM, sig_handler);
+	err = core_load();
+	if (!err) {
+		while (!exiting) {
+			err = core_poll(POLL_TIMEOUT_MS, -1);
+			if (err < 0) {
+				as_output_diagnostic("Error polling ring buffer: %d\n", err);
+				break;
+			}
+		}
+		core_close();
+	}
+	for (int i = 0; i < env.command_count; i++)
+		free(env.command_list[i]);
 	return err < 0 ? -err : 0;
 }
+#endif

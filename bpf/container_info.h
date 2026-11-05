@@ -6,6 +6,8 @@
 #ifndef __CONTAINER_INFO_H
 #define __CONTAINER_INFO_H
 
+#include "process_output.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -87,11 +89,11 @@ static void print_container_fields(pid_t host_pid)
 {
 	int ns_pid = get_ns_pid(host_pid);
 	if (ns_pid > 0) {
-		printf(",\"ns_pid\":%d", ns_pid);
+		as_output_printf(",\"ns_pid\":%d", ns_pid);
 		char container_id[16];
 		if (get_container_id(host_pid, container_id, sizeof(container_id)) == 0 &&
 		    container_id[0] != '\0') {
-			printf(",\"container_id\":\"%s\"", container_id);
+			as_output_printf(",\"container_id\":\"%s\"", container_id);
 		}
 	}
 }

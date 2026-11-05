@@ -11,6 +11,36 @@ struct {
 	__type(value, struct agg_value);
 } event_agg_map SEC(".maps");
 
+/* The upstream network identity enlarged agg_key. Keep path aggregation
+ * below the BPF 512-byte combined stack limit. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct agg_key);
+} fs_agg_key_scratch SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct agg_value);
+} agg_value_scratch SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct correlated_file_key);
+	__type(value, struct agg_value);
+} correlated_file_agg_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct correlated_file_key);
+} correlated_file_key_scratch SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_TRACKED_PIDS);
@@ -70,6 +100,42 @@ struct {
 	__type(value, u64);
 } listen_socket_map SEC(".maps");
 
+/* Snapshot the entry context; no lookup of the current Tool at syscall exit. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, u64);
+	__type(value, struct event);
+} pending_file_renames SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct event);
+} rename_event_scratch SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, u64);
+	__type(value, struct pending_file_open);
+} pending_file_opens SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct file_descriptor_key);
+	__type(value, struct tracked_file_descriptor);
+} tracked_file_descriptors SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, u64);
+	__type(value, struct pending_file_dup);
+} pending_file_dups SEC(".maps");
+
 const volatile bool filter_pids = false;
 const volatile bool filter_cgroup = false;
 const volatile bool filter_cgroup_children = false;
@@ -81,5 +147,6 @@ const volatile bool trace_network = false;
 const volatile bool trace_signals = false;
 const volatile bool trace_memory = false;
 const volatile bool trace_cow = false;
+const volatile bool trace_python_async_context = false;
 
 #endif /* __PROCESS_EXT_BPF_STATE_H */

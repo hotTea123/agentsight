@@ -126,6 +126,21 @@ static void test_agg_key_zero_initialisation(void)
 	test_assert(k.detail[0] == '\0',"zero-init: detail[0] == NUL");
 }
 
+static void test_correlated_file_key_fields(void)
+{
+	printf("\n" BLUE "Testing struct correlated_file_key:" RESET "\n");
+
+	struct correlated_file_key key = {0};
+	test_assert(sizeof(key.filepath) == MAX_FILENAME_LEN,
+	            "correlated_file_key.filepath is MAX_FILENAME_LEN bytes");
+	test_assert(sizeof(key.tool_context.trace_id) == TRACE_ID_SIZE,
+	            "correlated_file_key carries trace ID");
+	test_assert(sizeof(key.tool_context.span_id) == SPAN_ID_SIZE,
+	            "correlated_file_key carries parent span ID");
+	test_assert(key.correlation_source == ASYNC_CORRELATION_NONE,
+	            "correlated_file_key zero-init has no correlation source");
+}
+
 /* ======================================================================== */
 /* struct agg_value                                                          */
 /* ======================================================================== */
@@ -291,6 +306,7 @@ int main(void)
 	test_agg_key_total_size();
 	test_agg_key_field_offsets();
 	test_agg_key_zero_initialisation();
+	test_correlated_file_key_fields();
 
 	/* struct agg_value */
 	test_agg_value_field_sizes();

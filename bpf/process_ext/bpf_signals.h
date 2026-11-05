@@ -121,6 +121,7 @@ int trace_kill(struct trace_event_raw_sys_enter *ctx)
 SEC("tp/sched/sched_process_fork")
 int trace_fork(struct trace_event_raw_sched_process_fork *ctx)
 {
+	propagate_python_context_to_child((u32)ctx->child_pid);
 	if (!trace_signals)
 		return 0;
 	if (!is_event_tracked())
