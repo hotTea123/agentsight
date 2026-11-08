@@ -111,6 +111,9 @@ int BPF_URETPROBE(bash_readline, const void *ret)
 SEC("tp/sched/sched_process_exec")
 int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 {
+#ifdef AGENTSIGHT_TEST_CAPTURE
+	if (!is_event_tracked()) return 0;
+#endif
 	struct task_struct *task;
 	unsigned fname_off;
 	struct event *e;
@@ -215,6 +218,16 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 	id = bpf_get_current_pid_tgid();
 	pid = id >> 32;
 	tid = (u32)id;
+#ifdef AGENTSIGHT_TEST_CAPTURE
+	bool test_tracked = is_event_tracked();
+	bpf_map_delete_elem(&tracked_pids, &tid);
+	bpf_map_delete_elem(&write_ctx_map, &id);
+	if (pid == tid && pid == test_root_pid && test_tracked) {
+		u32 zero = 0, exited = 1;
+		bpf_map_update_elem(&test_root_exited, &zero, &exited, BPF_ANY);
+	}
+	if (!test_tracked) return 0;
+#endif
 	bool had_context = trace_python_async_context &&
 		bpf_map_lookup_elem(&python_process_spans, &pid) != NULL;
 	if (trace_python_async_context) {
@@ -298,6 +311,9 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 SEC("tp/syscalls/sys_enter_openat")
 int trace_openat(struct trace_event_raw_sys_enter *ctx)
 {
+#ifdef AGENTSIGHT_TEST_CAPTURE
+	if (!is_event_tracked()) return 0;
+#endif
 	struct event *e;
 	pid_t pid;
 	char filepath[MAX_FILENAME_LEN];
@@ -359,6 +375,9 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
 SEC("tp/syscalls/sys_enter_open")
 int trace_open(struct trace_event_raw_sys_enter *ctx)
 {
+#ifdef AGENTSIGHT_TEST_CAPTURE
+	if (!is_event_tracked()) return 0;
+#endif
 	struct event *e;
 	pid_t pid;
 	char filepath[MAX_FILENAME_LEN];

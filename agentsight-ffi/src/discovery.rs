@@ -64,6 +64,32 @@ fn read_process(root: &Path, pid: i32) -> io::Result<Process> {
         .ok_or_else(|| io::Error::other("process exited or invalid stat"))
 }
 
+#[cfg(feature = "test-capture")]
+pub(super) fn process_key(root: &Path, pid: i32) -> io::Result<ProcessKey> {
+    read_process(root, pid).map(|p| p.key)
+}
+
+#[cfg(feature = "test-capture")]
+pub(super) fn collector_descends_from(root: &Path, target: ProcessKey) -> io::Result<bool> {
+    let mut pid = unsafe { libc::getpid() };
+    for _ in 0..128 {
+        if pid <= 1 {
+            return Ok(false);
+        }
+        let p = read_process(root, pid)?;
+        if p.key == target {
+            return Ok(true);
+        }
+        if p.parent == pid {
+            break;
+        }
+        pid = p.parent;
+    }
+    Err(io::Error::other(
+        "cannot establish a bounded collector ancestry",
+    ))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FileStamp {
     dev: u64,

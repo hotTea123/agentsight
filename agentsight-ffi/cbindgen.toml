@@ -10,4 +10,4 @@ header = "/* AgentSight tool-span evidence ABI v2. See README.md for ownership a
 parse_deps = false
 
 [export]
-exclude = ["CoreConfig", "ElfInfo", "as_core_open", "as_core_poll", "as_core_close", "as_core_target_changed", "as_inspect_elf", "as_validate_code_offset"]
+exclude = ["CoreConfig", "ElfInfo", "as_core_open", "as_core_poll", "as_core_close", "as_core_target_changed", "as_inspect_elf", "as_validate_code_offset", "as_core_test_open", "agentsight_set_test_target"]

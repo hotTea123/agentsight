@@ -15,8 +15,13 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+// Test build reuses only proc identity parsing; the production scanner stays unused.
+#[cfg_attr(feature = "test-capture", allow(dead_code))]
 mod discovery;
+#[cfg(not(feature = "test-capture"))]
 mod supervisor;
+#[cfg(feature = "test-capture")]
+mod test_capture;
 
 pub const AGENTSIGHT_ABI_VERSION: u32 = 2;
 pub const AGENTSIGHT_EVENT_FILE_OPEN: u32 = 1;
@@ -123,6 +128,7 @@ pub struct AgentsightStats {
 }
 
 #[repr(C)]
+#[cfg(not(feature = "test-capture"))]
 struct CoreConfig {
     pid: i32,
     cgroup_children: u32,
@@ -138,6 +144,7 @@ struct CoreConfig {
     procfs_root: *const c_char,
 }
 unsafe extern "C" {
+    #[cfg(not(feature = "test-capture"))]
     fn as_core_open(
         cfg: *const CoreConfig,
         output: unsafe extern "C" fn(*mut c_void, i32, *const c_char, usize),
@@ -145,6 +152,7 @@ unsafe extern "C" {
     ) -> i32;
     fn as_core_poll(timeout_ms: i32, wake_fd: i32) -> i32;
     fn as_core_close();
+    #[cfg(not(feature = "test-capture"))]
     fn as_core_target_changed() -> i32;
 }
 
@@ -153,7 +161,10 @@ struct Config {
     capacity: usize,
     bytes: usize,
     procfs_root: CString,
+    #[cfg(not(feature = "test-capture"))]
     interval_ms: u32,
+    #[cfg(feature = "test-capture")]
+    test_target: Option<discovery::ProcessKey>,
 }
 
 #[repr(C)]
@@ -343,10 +354,14 @@ unsafe fn config_from_abi(c: *const AgentsightConfig) -> Result<Config, (i32, St
         capacity,
         bytes: bytes as usize,
         procfs_root,
+        #[cfg(not(feature = "test-capture"))]
         interval_ms,
+        #[cfg(feature = "test-capture")]
+        test_target: None,
     })
 }
 
+#[cfg(not(feature = "test-capture"))]
 fn hex_id<const N: usize>(s: Option<&str>) -> Option<[u8; N]> {
     let s = s?;
     if s.len() != N * 2 {
@@ -402,11 +417,23 @@ fn receive(shared: &Shared, kind: i32, bytes: &[u8]) {
         d.stats.aggregate_overflow += v["overflow_count"].as_u64().unwrap_or(0);
         return;
     }
-    if name == "ENHANCEMENT_RING_LOST" {
+    if name == "ENHANCEMENT_RING_LOST"
+        || (cfg!(feature = "test-capture") && name == "FILE_OPEN_LOST")
+    {
         d.stats.kernel_ring_dropped += v["count"].as_u64().unwrap_or(0);
         return;
     }
-    let event_type = match name {
+    #[cfg(feature = "test-capture")]
+    let (v, test_bytes) = match test_capture::normalize(v) {
+        Some(v) => v,
+        None => {
+            d.stats.filtered_records += 1;
+            return;
+        }
+    };
+    #[cfg(feature = "test-capture")]
+    let bytes = test_bytes.as_slice();
+    let event_type = match v["event"].as_str().unwrap_or("") {
         "FILE_OPEN" => AGENTSIGHT_EVENT_FILE_OPEN,
         "FILE_WRITE" => AGENTSIGHT_EVENT_FILE_WRITE,
         "FILE_RENAME" => AGENTSIGHT_EVENT_FILE_RENAME,
@@ -416,19 +443,25 @@ fn receive(shared: &Shared, kind: i32, bytes: &[u8]) {
             return;
         }
     };
-    let flags = v["agentsight_trace_flags"].as_u64().unwrap_or(0);
-    let ids = (
-        hex_id::<16>(v["agentsight_trace_id"].as_str()),
-        hex_id::<8>(v["agentsight_parent_span_id"].as_str()),
-    );
-    let (Some(trace_id), Some(parent_span_id)) = ids else {
-        d.stats.filtered_records += 1;
-        return;
+    #[cfg(not(feature = "test-capture"))]
+    let (trace_id, parent_span_id, flags) = {
+        let flags = v["agentsight_trace_flags"].as_u64().unwrap_or(0);
+        let ids = (
+            hex_id::<16>(v["agentsight_trace_id"].as_str()),
+            hex_id::<8>(v["agentsight_parent_span_id"].as_str()),
+        );
+        let (Some(trace_id), Some(parent_span_id)) = ids else {
+            d.stats.filtered_records += 1;
+            return;
+        };
+        if flags & 1 == 0 {
+            d.stats.filtered_records += 1;
+            return;
+        }
+        (trace_id, parent_span_id, flags)
     };
-    if flags & 1 == 0 {
-        d.stats.filtered_records += 1;
-        return;
-    }
+    #[cfg(feature = "test-capture")]
+    let (trace_id, parent_span_id, flags) = ([0; 16], [0; 8], 0u64);
     let Some(timestamp) = v["timestamp"].as_u64() else {
         d.stats.invalid_records += 1;
         return;
@@ -461,7 +494,11 @@ fn receive(shared: &Shared, kind: i32, bytes: &[u8]) {
     let event = Box::new(OwnedEvent {
         public: AgentsightEvent {
             struct_size: size_of::<AgentsightEvent>() as u32,
-            schema_version: 1,
+            schema_version: if cfg!(feature = "test-capture") {
+                1001
+            } else {
+                1
+            },
             event_type,
             trace_flags: flags as u32,
             pid: v["pid"].as_u64().unwrap_or(0) as u32,
@@ -502,7 +539,16 @@ unsafe extern "C" fn core_output(context: *mut c_void, kind: i32, data: *const c
 }
 
 fn worker(s: Arc<Shared>, cfg: Config, ready: mpsc::SyncSender<i32>, _reservation: Reservation) {
-    let result = catch_unwind(AssertUnwindSafe(|| supervisor::run(&s, &cfg, &ready)));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(feature = "test-capture")]
+        {
+            test_capture::run(&s, &cfg, &ready)
+        }
+        #[cfg(not(feature = "test-capture"))]
+        {
+            supervisor::run(&s, &cfg, &ready)
+        }
+    }));
     let rc = result.unwrap_or(-libc::EFAULT);
     if rc != 0 {
         let mut d = lock(&s.data);
@@ -640,6 +686,13 @@ pub unsafe extern "C" fn agentsight_start(h: *mut AgentsightHandle) -> i32 {
                 .config
                 .clone()
                 .ok_or_else(|| error(libc::EINVAL, "set_config is required before start"))?;
+            #[cfg(feature = "test-capture")]
+            if cfg.test_target.is_none() {
+                return Err(error(
+                    libc::EINVAL,
+                    "agentsight_set_test_target is required before start",
+                ));
+            }
             {
                 let mut d = lock(&h.shared.data);
                 if !d.queue.is_empty() {
@@ -804,5 +857,5 @@ pub unsafe extern "C" fn agentsight_get_stats(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "test-capture")))]
 mod tests;

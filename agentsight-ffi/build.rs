@@ -5,6 +5,7 @@ fn main() {
     let bpf = root.parent().unwrap().join("bpf");
     let target = env::var("TARGET").unwrap();
     let host = env::var("HOST").unwrap();
+    let test_capture = env::var_os("CARGO_FEATURE_TEST_CAPTURE").is_some();
     assert!(
         target == host && target.contains("linux"),
         "native Linux builds only; build separately on each target architecture"
@@ -30,6 +31,15 @@ fn main() {
         Command::new("make")
             .current_dir(&bpf)
             .arg("ffi-core")
+            .args(if test_capture {
+                vec![
+                    "TEST_CAPTURE=1",
+                    "OUTPUT=.output-test",
+                    "FFI_OUTPUT=.output-ffi-test",
+                ]
+            } else {
+                vec![]
+            })
             .status()
             .expect("make must be installed")
             .success(),
@@ -37,7 +47,12 @@ fn main() {
     );
     println!(
         "cargo:rustc-link-search=native={}",
-        bpf.join(".output-ffi").display()
+        bpf.join(if test_capture {
+            ".output-ffi-test"
+        } else {
+            ".output-ffi"
+        })
+        .display()
     );
     println!("cargo:rustc-link-lib=static=agentsight_core");
     println!("cargo:rustc-link-lib=static=bpf");

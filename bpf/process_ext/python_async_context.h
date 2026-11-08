@@ -7,8 +7,10 @@
 
 static __always_inline void count_python_ring_drop(void)
 {
+#ifndef AGENTSIGHT_TEST_CAPTURE
 	if (!trace_python_async_context)
 		return;
+#endif
 	u32 zero = 0;
 	u64 *count = bpf_map_lookup_elem(&file_open_dropped, &zero);
 	if (count)

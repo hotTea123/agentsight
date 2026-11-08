@@ -25,4 +25,8 @@ int as_core_open(const struct as_core_config *, as_core_output_fn, void *);
 int as_core_poll(int timeout_ms, int wake_fd);
 void as_core_close(void);
 int as_core_target_changed(void);
+#ifdef AGENTSIGHT_TEST_CAPTURE
+int as_core_test_open(int32_t pid, uint64_t start_ticks, const char *procfs_root,
+                     as_core_output_fn output, void *context);
+#endif
 #endif

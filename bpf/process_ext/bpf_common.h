@@ -13,6 +13,20 @@ static __always_inline bool is_pid_tracked(void)
 	if (!filter_pids)
 		return true;  /* no filter mode: trace all */
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
+#ifdef AGENTSIGHT_TEST_CAPTURE
+	u32 zero = 0;
+	u32 *exited = bpf_map_lookup_elem(&test_root_exited, &zero);
+	if (!test_root_pid || !exited || *exited)
+		return false;
+	if (pid == test_root_pid) {
+		struct task_struct *task = (void *)bpf_get_current_task();
+		struct task_struct *leader = BPF_CORE_READ(task, group_leader);
+		u64 start = bpf_core_field_exists(leader->start_boottime) ?
+			BPF_CORE_READ(leader, start_boottime) : BPF_CORE_READ(leader, start_time);
+		if (!test_ns_per_tick || start / test_ns_per_tick != test_root_start_ticks)
+			return false;
+	}
+#endif
 	return bpf_map_lookup_elem(&tracked_pids, &pid) != NULL;
 }
 

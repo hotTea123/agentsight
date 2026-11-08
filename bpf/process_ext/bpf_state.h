@@ -48,6 +48,19 @@ struct {
 	__type(value, u8);
 } tracked_pids SEC(".maps");
 
+#ifdef AGENTSIGHT_TEST_CAPTURE
+/* Test build only: bounded PID scope, never a global capture switch. */
+const volatile unsigned int test_root_pid = 0;
+const volatile unsigned long long test_root_start_ticks = 0;
+const volatile unsigned long long test_ns_per_tick = 10000000;
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u32);
+} test_root_exited SEC(".maps");
+#endif
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_TRACKED_CGROUPS);

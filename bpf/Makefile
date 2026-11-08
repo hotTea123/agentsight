@@ -22,6 +22,10 @@ VMLINUX := ../vmlinux/$(ARCH)/vmlinux.h
 # outdated
 INCLUDES := -I$(OUTPUT) -I. -I../libbpf/include/uapi -I$(dir $(VMLINUX))
 CFLAGS := -g -Wall
+ifeq ($(TEST_CAPTURE),1)
+CFLAGS += -DAGENTSIGHT_TEST_CAPTURE
+TEST_CPPFLAGS := -DAGENTSIGHT_TEST_CAPTURE
+endif
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 
 # AddressSanitizer flags
@@ -230,7 +234,7 @@ ffi-core: $(OUTPUT)/process.skel.h
 $(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(wildcard %.h) $(VMLINUX) | $(OUTPUT) $(BPFTOOL)
 	$(call msg,BPF,$@)
 	$(Q)$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH)		      \
-		     $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES)		      \
+		     $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES) $(TEST_CPPFLAGS) \
 		     -c $(filter %.c,$^) -o $(patsubst %.bpf.o,%.tmp.bpf.o,$@)
 	$(Q)$(BPFTOOL) gen object $@ $(patsubst %.bpf.o,%.tmp.bpf.o,$@)
 

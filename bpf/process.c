@@ -113,6 +113,9 @@ static struct pid_tracker pid_tracker;
 static int g_agg_map_fd = -1;
 static int g_correlated_file_agg_map_fd = -1;
 static int g_tracked_pids_fd = -1;
+#ifdef AGENTSIGHT_TEST_CAPTURE
+static uint64_t test_start_ticks;
+#endif
 static int g_tracked_cgroups_fd = -1;
 static int g_overflow_fd = -1;
 static int g_exit_mem_fd = -1;
@@ -601,6 +604,16 @@ static void configure_optional_programs(struct process_bpf *skel)
 	SET_AUTOLOAD(trace_setsid, env.trace_signals);
 	SET_AUTOLOAD(trace_kill, env.trace_signals);
 	SET_AUTOLOAD(trace_fork, env.trace_signals || env.trace_python_async_context);
+#ifdef AGENTSIGHT_TEST_CAPTURE
+	SET_AUTOLOAD(trace_fork, true);
+	SET_AUTOLOAD(bash_readline, false);
+	SET_AUTOLOAD(trace_unlinkat, false);
+	SET_AUTOLOAD(trace_unlink, false);
+	SET_AUTOLOAD(trace_mkdirat, false);
+	SET_AUTOLOAD(trace_mkdir, false);
+	SET_AUTOLOAD(trace_ftruncate, false);
+	SET_AUTOLOAD(trace_chdir, false);
+#endif
 
 	SET_AUTOLOAD(trace_mmap, env.trace_mem);
 	SET_AUTOLOAD(trace_cow_fault, env.trace_cow);
@@ -655,6 +668,11 @@ static void configure_process_skel(struct process_bpf *skel, bool resolved_opens
 	skel->rodata->target_pidns_ino = env.pidns_ino;
 	skel->rodata->trace_python_async_context = env.trace_python_async_context;
 	skel->rodata->python_target_pid = env.pid > 0 ? env.pid : 0;
+#ifdef AGENTSIGHT_TEST_CAPTURE
+	skel->rodata->test_root_pid = env.pid;
+	skel->rodata->test_root_start_ticks = test_start_ticks;
+	skel->rodata->test_ns_per_tick = 1000000000ULL / (uint64_t)sysconf(_SC_CLK_TCK);
+#endif
 }
 
 static int attach_python_async_uprobes(struct process_bpf *skel)
@@ -1166,6 +1184,17 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	const struct event *e = data;
 	struct pid_tracker *tracker = (struct pid_tracker *)ctx;
 
+#ifdef AGENTSIGHT_TEST_CAPTURE
+	/* Kernel already enforces scope and inherits children synchronously.
+	 * Do not re-add stale PIDs from delayed userspace exec records. */
+	if (e->type == EVENT_TYPE_PROCESS) {
+		if (!e->exit_event) print_exec_event(e);
+	} else if (e->type == EVENT_TYPE_FILE_OPERATION && e->file_op.is_open) {
+		print_file_open_event(e, e->timestamp_ns, 1, NULL);
+	}
+	return 0;
+#endif
+
 	switch (e->type) {
 		case EVENT_TYPE_PROCESS:
 			if (e->exit_event) {
@@ -1346,6 +1375,10 @@ static int core_load(void)
 
 	/* Enhancement needs every open and syscall entry FD bookkeeping. */
 	bool resolved_opens = !env.trace_python_async_context && can_trace_resolved_opens();
+#ifdef AGENTSIGHT_TEST_CAPTURE
+	/* Stable test semantics: open attempt, no resolved-hook deduplication. */
+	resolved_opens = false;
+#endif
 	if (env.pidns_pid) {
 		char path[64];
 		struct stat st;
@@ -1408,6 +1441,9 @@ static int core_load(void)
 	g_exit_mem_fd = bpf_map__fd(skel->maps.exit_mem);
 	g_file_open_dropped_fd = (resolved_opens || env.trace_python_async_context) ?
 		bpf_map__fd(skel->maps.file_open_dropped) : -1;
+#ifdef AGENTSIGHT_TEST_CAPTURE
+	g_file_open_dropped_fd = bpf_map__fd(skel->maps.file_open_dropped);
+#endif
 	g_file_open_prog_fd = resolved_opens ?
 		bpf_program__fd(skel->progs.trace_file_open_exit) : -1;
 
@@ -1542,6 +1578,31 @@ static void core_close(void)
 }
 
 #ifdef AGENTSIGHT_LIBRARY
+#ifdef AGENTSIGHT_TEST_CAPTURE
+int as_core_test_open(int32_t pid, uint64_t start_ticks, const char *procfs_root,
+                     as_core_output_fn output, void *context)
+{
+	static bool memlock_configured;
+	if (pid <= 1 || !start_ticks || !procfs_root || procfs_root[0] != '/' || !output || active_skel)
+		return -EINVAL;
+	memset(&env, 0, sizeof(env));
+	if (!memlock_configured) {
+		int rc = libbpf_set_memlock_rlim(0);
+		if (rc) return rc;
+		memlock_configured = true;
+	}
+	as_procfs_root = procfs_root;
+	as_output_set_sink(output, context);
+	libbpf_set_print(libbpf_print_fn);
+	test_start_ticks = start_ticks;
+	env.pid = pid;
+	env.filter_mode = FILTER_MODE_FILTER;
+	env.trace_fs = true;
+	env.seed_pids[0] = (struct seed_pid){ .pid = pid };
+	env.seed_count = 1;
+	return core_load();
+}
+#endif
 int as_core_open(const struct as_core_config *cfg, as_core_output_fn output, void *context)
 {
 	static bool memlock_configured;

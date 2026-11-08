@@ -121,6 +121,17 @@ int trace_kill(struct trace_event_raw_sys_enter *ctx)
 SEC("tp/sched/sched_process_fork")
 int trace_fork(struct trace_event_raw_sched_process_fork *ctx)
 {
+#ifdef AGENTSIGHT_TEST_CAPTURE
+	if (is_event_tracked()) {
+		u32 child = ctx->child_pid;
+		u8 present = 1;
+		if (bpf_map_update_elem(&tracked_pids, &child, &present, BPF_ANY) < 0) {
+			u32 zero = 0;
+			u64 *overflow = bpf_map_lookup_elem(&agg_overflow_count, &zero);
+			if (overflow) __sync_fetch_and_add(overflow, 1);
+		}
+	}
+#endif
 	propagate_python_context_to_child((u32)ctx->child_pid);
 	if (!trace_signals)
 		return 0;

@@ -1,5 +1,9 @@
 # libagentsight：进程内工具 span 证据采集
 
+本分支额外提供独立的 [ICAgent采集链路测试库](TEST_CAPTURE.md)，通过test-capture特性构建
+并交付为libagentsight_test.so。它无需marker，但输出未关联的测试事件；默认构建及下文
+正式增强契约保持不变，不应把测试库用于生产工具关联。
+
 本模块供 ICAgent 等 Go/C 宿主加载。Rust 提供稳定 C ABI、后台线程、有界队列、
 eventfd、错误和统计；直接调用现有 C/libbpf 采集核心。**不启动 AgentSight 或
 `bpf/process` 子进程，不包含 Tokio、数据库、LLM 解析和 OTLP 上报。**
