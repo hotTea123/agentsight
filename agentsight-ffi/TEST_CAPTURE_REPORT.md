@@ -57,3 +57,19 @@
 5. 普通rename是目录聚合、只保留最近目标；write路径可能是排出时FD查询结果，不能当作完整文件审计。
 6. 测试事件没有真实trace/span身份。若需要trace后端展示，接入方必须创建明确的独立测试trace。
 7. 本库与宿主同进程，原生崩溃/OOM仍可能影响宿主；测试能力不得误用于生产采集。
+
+## 2026-11-09：独立README接口指南复验
+
+本轮重写TEST_CAPTURE.md（交付包README.md），只依赖测试.so、两个头文件及文档内完整Go代码，
+不要求读取其他接入文档。没有修改或重新编译.so与头文件。
+
+- 从README提取Go代码，按文档目录布局执行go build -a、go vet和gofmt检查，均通过。
+- 无参数运行完成版本、初始化、配置、FD、统计、诊断、空队列、NULL事件释放、stop和free；
+  输出BASIC PASS、FREE rc=0，退出码0。此模式没有加载BPF，不等于真实采集通过。
+- PID1返回-EINVAL，不存在PID返回-ESRCH；错误路径均输出FREE rc=0并以非零退出码结束。
+- 文档Go代码真实消费17条事件，覆盖open/write/rename/exec，输出CAPTURE PASS、FREE rc=0；
+  结束时queued=0、dropped=0、ring_dropped=0，退出码0。
+- 使用同一.so再次执行既有独立进程回归，两轮各33条，隔离、短子进程、溢出、重启及目标退出断言通过。
+- 原始结果在交付包reports/readme-interface-verification-20261109.json；库SHA256仍为本文上方记录的值。
+- 环境：Linux ARM64、Go1.21.4、内核6.6.0-28.0.0.34.oe2403.aarch64。
+  未验证ICAgent私有框架接线或上报，也未新增其他架构/内核的兼容性结论。
