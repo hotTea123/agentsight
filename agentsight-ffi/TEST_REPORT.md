@@ -18,7 +18,7 @@
 
 ## 环境
 
-- 所有 AgentSight C/BPF/Rust 构建在 `claude-agentsight-ebpf-build` 容器中进行。
+- 本次 AgentSight C/BPF/Rust 构建在已配置工具链的 Linux ARM64 隔离环境中进行。
 - Linux ARM64，实际宿主内核 `6.6.0-28.0.0.34.oe2403.aarch64`。
 - Rust 1.88.0，CPython 3.11.2；Go 消费示例在宿主 Go 1.21.4/ARM64 验证。
 - 库动态依赖 `libelf.so.1`、`libz.so.1`、`libgcc_s.so.1`、glibc。
@@ -67,7 +67,9 @@ observability callback，不自建替代 tool span。每个场景执行两轮，
 
 ## 复测入口
 
-先将当前源代码和 libbpf/bpftool 子模块同步到规定的构建容器目录，再执行：
+先准备匹配目标架构的 Linux 环境、Rust 1.88+、C 编译器、Clang/BPF、make 和
+libelf/zlib 开发文件，并获取完整的 libbpf/bpftool 子模块。以下从 AgentSight 源码
+根目录执行；复现不依赖固定容器名称或路径，真实采集另需相应内核和权限：
 
 ```sh
 make -C bpf process libagentsight_tool_marker.so unit-test

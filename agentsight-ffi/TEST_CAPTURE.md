@@ -22,7 +22,6 @@ examples/go-test/main.go        可构建Go消费示例
 README.md                      本说明（源码中为TEST_CAPTURE.md）
 TEST_CAPTURE_REPORT.md         本版测试结果和未验证项
 reports/                       真实采集验证记录
-licenses/                      开源许可材料
 ```
 
 当前产物：Linux ARM64；Go示例验证环境1.21.4；依赖glibc（最高所需符号GLIBC_2.34）、
@@ -169,19 +168,21 @@ stop、排空并free。测试文件保留在终端A打印/记录的专用目录�
 
 ## 7. 维护者源码构建与回归
 
-仅库维护者执行，必须在claude-agentsight-ebpf-build容器中，将当前分支同步到
-/tmp/jiuwenclaw-agentsight-build。容器使用cc/clang，HOSTCC避免默认gcc不存在：
+仅库维护者执行；使用二进制包无需重新编译。准备与目标架构一致的Linux环境、
+Rust 1.88+、C编译器、Clang/BPF、make、libelf/zlib开发文件及完整的libbpf/bpftool子模块。
+在AgentSight源码根目录执行，不限定容器名称或源码路径。下例使用可用的cc作为HOSTCC，
+可按环境替换为gcc或clang；首次构建需能下载Cargo.lock中锁定的依赖：
 
 ```sh
-MAKEFLAGS="HOSTCC=cc" cargo test --offline --release --locked --features test-capture \
+MAKEFLAGS="HOSTCC=cc" cargo test --release --locked --features test-capture \
   --manifest-path agentsight-ffi/Cargo.toml --target-dir /tmp/agentsight-test-capture-target
-MAKEFLAGS="HOSTCC=cc" cargo build --offline --release --locked --features test-capture \
+MAKEFLAGS="HOSTCC=cc" cargo build --release --locked --features test-capture \
   --manifest-path agentsight-ffi/Cargo.toml --target-dir /tmp/agentsight-test-capture-target
 ```
 
 Cargo crate名字仍为agentsight，构建结果名为libagentsight.so；**仅将test-capture构建产物**
 复制并命名为libagentsight_test.so交付，不能把正式库简单改名当测试库。
-test-capture使用独立BPF/PIC输出目录，不复用正式构建的采集对象。离线构建要求依赖已缓存。
+test-capture使用独立BPF/PIC输出目录，不复用正式构建的采集对象。依赖已缓存时可加--offline。
 
 真实验收入口（会启动探针和专用进程，在有权限环境执行）：
 

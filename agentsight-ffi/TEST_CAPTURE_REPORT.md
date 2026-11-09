@@ -5,7 +5,7 @@
 
 ## 构建与交付标识
 
-- 构建容器：claude-agentsight-ebpf-build；源码同步位置：/tmp/jiuwenclaw-agentsight-build。
+- 构建环境：已配置C/BPF/Rust工具链的Linux ARM64隔离环境；构建前已核对源码一致性。
 - Rust 1.88.0，Linux ARM64；Go消费程序在宿主Go1.21.4构建，在同一宿主内核的构建容器实际运行。
 - `test-capture`特性使用独立BPF、PIC和Cargo输出目录；发布文件名libagentsight_test.so。
 - 库ABI2，公开基础结构大小32/88/192，测试事件schema1001，新增一个测试扩展接口。
@@ -46,7 +46,7 @@
 - 交付包副本：`reports/verification.json`，含两轮事件、溢出结果和Go输出。
 - 命令与手动测试步骤见TEST_CAPTURE.md（交付包README.md）。
 - 测试创建的临时业务文件已由脚本清理，专用测试进程已结束；未操作真实Jiuwen业务文件。
-- 原正式交付包的两个.so及基础头文件不变；本次新增独立测试交付目录，不覆盖正式包。
+- 测试库交付时新增独立测试目录，原正式交付包的两个.so及基础头文件不变。
 
 ## 未验证与限制
 
