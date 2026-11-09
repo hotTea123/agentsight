@@ -17,8 +17,7 @@ bind/unbind。采集库不能代替 marker，不能自行生成或猜测工具�
 当前产物为 Linux ARM64；amd64 要在对应架构的构建环境重新构建和验证，不能复用
 ARM64 二进制。头文件不能保证任意 libc、内核或 CPython 构建兼容。
 
-本项目必须在 `claude-agentsight-ebpf-build` 容器中构建，先同步当前工作树至
-`/tmp/jiuwenclaw-agentsight-build`。然后在该目录执行：
+项目构建（仅源码维护者；不是二进制接入步骤）：
 
 ```sh
 make -C bpf libagentsight_tool_marker.so
