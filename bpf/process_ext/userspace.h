@@ -2,6 +2,8 @@
 #ifndef __PROCESS_EXT_USERSPACE_H
 #define __PROCESS_EXT_USERSPACE_H
 
+#include "process_output.h"
+
 #include <bpf/bpf.h>
 #include <dirent.h>
 #include <errno.h>
@@ -30,7 +32,7 @@ static inline void print_clock_sync_anchor(const char *phase)
 	if (strftime(wall_prefix, sizeof(wall_prefix), "%Y-%m-%dT%H:%M:%S", &tm_utc) == 0)
 		return;
 
-	printf("{\"timestamp\":%llu,\"event\":\"CLOCK_SYNC\","
+	as_output_printf("{\"timestamp\":%llu,\"event\":\"CLOCK_SYNC\","
 	       "\"phase\":\"%s\",\"mono_ns\":%llu,"
 	       "\"wall_time_ns\":%llu,"
 	       "\"wall_time\":\"%s.%09ldZ\"}\n",
@@ -39,7 +41,7 @@ static inline void print_clock_sync_anchor(const char *phase)
 	       (unsigned long long)mono_ns,
 	       (unsigned long long)wall_ns,
 	       wall_prefix, realtime.tv_nsec);
-	fflush(stdout);
+	as_output_flush();
 }
 
 static inline bool normalize_cgroup_path(const char *input, char *output, size_t output_len)

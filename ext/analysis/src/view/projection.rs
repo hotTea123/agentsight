@@ -63,7 +63,9 @@ impl MaterializedView {
             }
             EventKind::ProcessExec => self.ingest_process_audit(event, "exec"),
             EventKind::ProcessExit => self.ingest_process_audit(event, "exit"),
-            EventKind::FsOpen if is_writable_open(event) => self.ingest_file_audit(event),
+            EventKind::FsOpen if is_writable_open(event) || has_tool_correlation(event) => {
+                self.ingest_file_audit(event)
+            }
             EventKind::FsWrite | EventKind::FsMutation => self.ingest_file_audit(event),
             EventKind::Unknown if is_process_summary_write_event(event) => {
                 self.ingest_file_audit(event)
@@ -768,7 +770,24 @@ impl MaterializedView {
             .attributes
             .get("path")
             .or_else(|| event.attributes.get("filepath"))
+            .or_else(|| event.attributes.get("destination_path"))
             .and_then(Value::as_str);
+		let action = match event.kind {
+			EventKind::FsOpen => "open",
+			EventKind::FsWrite => "write",
+			EventKind::FsMutation
+				if process_event_name(&event.attributes) == Some("FILE_RENAME") => "rename",
+			_ => "write",
+		};
+        let status = if action == "rename" {
+            match event.attributes.get("syscall_return").and_then(Value::as_i64) {
+                Some(0) => "success",
+                Some(-4095..=-1) => "error",
+                _ => "observed",
+            }
+        } else {
+            "observed"
+        };
         self.emit_audit_event(AuditEventRow {
             id: format!("audit-{}", event.event_id),
             timestamp_ms: event.timestamp_ms,
@@ -776,9 +795,9 @@ impl MaterializedView {
             pid: event.pid,
             comm: event.comm.clone(),
             subject: event.comm.clone(),
-            action: Some("write".to_string()),
+            action: Some(action.to_string()),
             target: target.map(str::to_string),
-            status: Some("observed".to_string()),
+            status: Some(status.to_string()),
             summary: event.summary.clone(),
             details: event.attributes.clone(),
             view_source: "view".to_string(),
@@ -967,6 +986,19 @@ fn is_writable_open(event: &CanonicalEvent) -> bool {
     const O_TRUNC: i64 = 0o1000;
     const O_APPEND: i64 = 0o2000;
     (flags & O_ACCMODE) != 0 || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0
+}
+
+fn has_tool_correlation(event: &CanonicalEvent) -> bool {
+    event
+        .attributes
+        .get("agentsight_trace_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.len() == 32)
+        && event
+            .attributes
+            .get("agentsight_parent_span_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.len() == 16)
 }
 
 fn is_process_summary_write_event(event: &CanonicalEvent) -> bool {
@@ -1586,5 +1618,105 @@ mod tests {
             |row| row.http_exchange_id.as_deref() == Some("another-exchange")
                 && row.correlation_status.as_deref() == Some("unlinked")
         ));
+    }
+
+    #[test]
+    fn correlated_read_only_open_is_materialized_for_tool_enhancement() {
+        let mut view = MaterializedView::new();
+        let event = Event::new_with_timestamp(
+            2_000,
+            "process".to_string(),
+            42,
+            "python3".to_string(),
+            json!({
+                "event": "FILE_OPEN",
+                "tid": 43,
+                "filepath": "/tmp/input.txt",
+                "flags": 0,
+                "agentsight_trace_id": "0123456789abcdef0123456789abcdef",
+                "agentsight_parent_span_id": "0123456789abcdef",
+                "agentsight_task_id": "0000aaaabbbbcccc",
+                "agentsight_bound_task_id": "0000aaaabbbbcccc",
+                "agentsight_correlation_source": "task"
+            }),
+        );
+
+        view.ingest_event(&event).expect("ingest correlated file open");
+        let snapshot = view.export_snapshot(crate::model::SnapshotOptions { audit_limit: 100 });
+        let row = snapshot
+            .audit_events
+            .iter()
+            .find(|row| row.audit_type == "file")
+            .expect("file audit row");
+        assert_eq!(row.action.as_deref(), Some("open"));
+        assert_eq!(row.target.as_deref(), Some("/tmp/input.txt"));
+        assert_eq!(
+            row.details["agentsight_parent_span_id"],
+            "0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn correlated_rename_preserves_both_paths() {
+        let mut view = MaterializedView::new();
+        let event = Event::new_with_timestamp(
+            2_000,
+            "process".to_string(),
+            42,
+            "python3".to_string(),
+            json!({
+                "event": "FILE_RENAME",
+                "tid": 43,
+                "filepath": "/tmp/context.json",
+                "source_path": "/tmp/context.tmp",
+                "destination_path": "/tmp/context.json",
+                "agentsight_trace_id": "0123456789abcdef0123456789abcdef",
+                "agentsight_parent_span_id": "0123456789abcdef",
+                "agentsight_task_id": "0000aaaabbbbcccc",
+                "agentsight_bound_task_id": "0000aaaabbbbcccc",
+                "agentsight_correlation_source": "task"
+            }),
+        );
+
+        view.ingest_event(&event).expect("ingest correlated rename");
+        let snapshot = view.export_snapshot(crate::model::SnapshotOptions { audit_limit: 100 });
+        let row = snapshot
+            .audit_events
+            .iter()
+            .find(|row| row.audit_type == "file")
+            .expect("file audit row");
+        assert_eq!(row.action.as_deref(), Some("rename"));
+        assert_eq!(row.target.as_deref(), Some("/tmp/context.json"));
+        assert_eq!(row.details["source_path"], "/tmp/context.tmp");
+        assert_eq!(row.details["destination_path"], "/tmp/context.json");
+        assert_eq!(row.status.as_deref(), Some("observed"));
+    }
+
+    #[test]
+    fn rename_failure_and_retry_remain_separate() {
+        let mut view = MaterializedView::new();
+        for (timestamp, result) in [(2_000, -13), (2_001, 0)] {
+            let event = Event::new_with_timestamp(
+                timestamp, "process".to_string(), 42, "python3".to_string(),
+                json!({
+                    "event": "FILE_RENAME",
+                    "source_path": "/tmp/b.tmp",
+                    "destination_path": "/tmp/b.md",
+                    "syscall_return": result,
+                    "count": 1,
+                    "agentsight_trace_id": "0123456789abcdef0123456789abcdef",
+                    "agentsight_parent_span_id": "0123456789abcdef"
+                }),
+            );
+            view.ingest_event(&event).unwrap();
+        }
+        let snapshot = view.export_snapshot(crate::model::SnapshotOptions { audit_limit: 100 });
+        let rows: Vec<_> = snapshot.audit_events.iter()
+            .filter(|row| row.action.as_deref() == Some("rename")).collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.status.as_deref() == Some("error")
+            && row.details["syscall_return"] == -13));
+        assert!(rows.iter().any(|row| row.status.as_deref() == Some("success")
+            && row.details["syscall_return"] == 0));
     }
 }

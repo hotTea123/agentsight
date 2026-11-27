@@ -237,6 +237,109 @@ static int capture_print_summary_json(const struct agg_key *key,
 	return (int)n;
 }
 
+static int capture_print_rename_json(const struct event *event, char *buf, size_t size)
+{
+	FILE *stream = tmpfile();
+	if (!stream)
+		return -1;
+	fflush(stdout);
+	int saved = dup(STDOUT_FILENO);
+	if (saved < 0 || dup2(fileno(stream), STDOUT_FILENO) < 0) {
+		if (saved >= 0)
+			close(saved);
+		fclose(stream);
+		return -1;
+	}
+	print_file_rename_json(event);
+	fflush(stdout);
+	dup2(saved, STDOUT_FILENO);
+	close(saved);
+	rewind(stream);
+	size_t n = fread(buf, 1, size - 1, stream);
+	buf[n] = '\0';
+	fclose(stream);
+	return (int)n;
+}
+
+static void test_rename_results(void)
+{
+	struct event event = {
+		.type = EVENT_TYPE_FILE_RENAME_RESULT,
+		.pid = 42, .tid = 43, .timestamp_ns = 1234, .duration_ns = 50,
+		.correlation_source = ASYNC_CORRELATION_TASK,
+		.task_id = 17, .bound_task_id = 17,
+		.file_rename = {
+			.source_path = "/tmp/b\\\".tmp",
+			.destination_path = "/tmp/b.md",
+			.source_dirfd = -100, .destination_dirfd = -100,
+			.result = -13, .variant = 1,
+		},
+	};
+	memset(event.tool_context.trace_id, 0x11, TRACE_ID_SIZE);
+	memset(event.tool_context.span_id, 0x22, SPAN_ID_SIZE);
+	char buf[4096];
+	test_assert(capture_print_rename_json(&event, buf, sizeof(buf)) > 0,
+	            "rename failure is serialized");
+	test_assert(strstr(buf, "\"syscall_return\":-13") != NULL,
+	            "rename preserves signed kernel return");
+	test_assert(strstr(buf, "\"syscall_errno\":13") != NULL,
+	            "rename serializes errno");
+	test_assert(strstr(buf, "\"syscall_name\":\"renameat\"") != NULL,
+	            "rename preserves syscall variant");
+	test_assert(strstr(buf, "\"count\":1") != NULL,
+	            "rename is a single operation");
+	test_assert(strstr(buf, "\"agentsight_parent_span_id\":\"2222222222222222\"") != NULL,
+	            "rename preserves snapshotted parent");
+	test_assert(strstr(buf, "/tmp/b\\\\\\\".tmp") != NULL,
+	            "rename escapes source path");
+	event.file_rename.result = 0;
+	capture_print_rename_json(&event, buf, sizeof(buf));
+	test_assert(strstr(buf, "\"syscall_return\":0") != NULL &&
+	            strstr(buf, "\"syscall_errno\"") == NULL,
+	            "successful rename does not invent an error");
+	event.correlation_source = ASYNC_CORRELATION_NONE;
+	test_assert(capture_print_rename_json(&event, buf, sizeof(buf)) == 0,
+	            "uncorrelated rename cannot become a correlated record");
+}
+
+static int capture_print_correlated_file_json(
+	const struct correlated_file_key *key,
+	const struct agg_value *val,
+	char *buf,
+	size_t buf_size)
+{
+	int pipefd[2];
+	if (pipe(pipefd) != 0)
+		return -1;
+
+	fflush(stdout);
+	int saved_stdout = dup(STDOUT_FILENO);
+	if (saved_stdout < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return -1;
+	}
+	if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
+		close(saved_stdout);
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return -1;
+	}
+	close(pipefd[1]);
+
+	print_correlated_file_json(key, val);
+	fflush(stdout);
+	dup2(saved_stdout, STDOUT_FILENO);
+	close(saved_stdout);
+
+	ssize_t n = read(pipefd[0], buf, buf_size - 1);
+	close(pipefd[0]);
+	if (n < 0)
+		return -1;
+	buf[n] = '\0';
+	return (int)n;
+}
+
 static void test_print_summary_json_basic_fields(void)
 {
 	printf("\n" BLUE "Testing print_summary_json() — basic JSON fields:" RESET "\n");
@@ -440,6 +543,53 @@ static void test_print_summary_json_newline_terminated(void)
 	test_assert(buf[n - 1] == '\n', "output ends with newline");
 }
 
+static void test_print_correlated_write_and_rename_json(void)
+{
+	printf("\n" BLUE "Testing correlated file JSON:" RESET "\n");
+
+	struct correlated_file_key key = {
+		.pid = 1234,
+		.tid = 1235,
+		.event_type = EVENT_TYPE_WRITE,
+		.task_id = 0xaaaabbbbccccULL,
+		.bound_task_id = 0xaaaabbbbccccULL,
+		.correlation_source = ASYNC_CORRELATION_TASK,
+	};
+	struct agg_value val = {
+		.count = 2,
+		.total_bytes = 142,
+		.last_ts = 9876543210ULL,
+	};
+	memset(key.tool_context.trace_id, 0x11, sizeof(key.tool_context.trace_id));
+	memset(key.tool_context.span_id, 0x22, sizeof(key.tool_context.span_id));
+	key.tool_context.trace_flags = 1;
+	strncpy(key.filepath, "/tmp/context.tmp", sizeof(key.filepath) - 1);
+	strncpy(val.comm, "python3", sizeof(val.comm) - 1);
+
+	char buf[2048];
+	int n = capture_print_correlated_file_json(&key, &val, buf, sizeof(buf));
+	test_assert(n > 0, "correlated write output is non-empty");
+	test_assert(strstr(buf, "\"event\":\"FILE_WRITE\"") != NULL,
+	            "write output has FILE_WRITE event");
+	test_assert(strstr(buf, "\"filepath\":\"/tmp/context.tmp\"") != NULL,
+	            "write output keeps descriptor path");
+	test_assert(strstr(buf, "\"total_bytes\":142") != NULL,
+	            "write output keeps total bytes");
+	test_assert(strstr(buf, "\"agentsight_correlation_source\":\"task\"") != NULL,
+	            "write output keeps task correlation");
+
+	key.event_type = EVENT_TYPE_FILE_RENAME;
+	strncpy(val.extra, "/tmp/context.json", sizeof(val.extra) - 1);
+	n = capture_print_correlated_file_json(&key, &val, buf, sizeof(buf));
+	test_assert(n > 0, "correlated rename output is non-empty");
+	test_assert(strstr(buf, "\"event\":\"FILE_RENAME\"") != NULL,
+	            "rename output has FILE_RENAME event");
+	test_assert(strstr(buf, "\"source_path\":\"/tmp/context.tmp\"") != NULL,
+	            "rename output keeps source path");
+	test_assert(strstr(buf, "\"destination_path\":\"/tmp/context.json\"") != NULL,
+	            "rename output keeps destination path");
+}
+
 /* ======================================================================== */
 /* Summary                                                                   */
 /* ======================================================================== */
@@ -483,6 +633,8 @@ int main(void)
 	test_print_summary_json_optional_extra();
 	test_print_summary_json_escaped_fields();
 	test_print_summary_json_newline_terminated();
+	test_print_correlated_write_and_rename_json();
+	test_rename_results();
 
 	print_test_summary();
 	return (tests_failed > 0) ? 1 : 0;

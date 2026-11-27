@@ -6,18 +6,21 @@
 #ifndef __CONTAINER_INFO_H
 #define __CONTAINER_INFO_H
 
+#include "process_output.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <sys/types.h>
+#include <limits.h>
 
 /* Read namespace PID from /proc/<pid>/status NSpid line.
  * Returns the innermost namespace PID, or -1 if not in a namespace. */
 static int get_ns_pid(pid_t host_pid)
 {
-	char path[64];
+	char path[PATH_MAX];
 	char line[256];
-	snprintf(path, sizeof(path), "/proc/%d/status", host_pid);
+	snprintf(path, sizeof(path), "%s/%d/status", as_procfs_root, host_pid);
 	FILE *f = fopen(path, "r");
 	if (!f)
 		return -1;
@@ -50,9 +53,9 @@ static int get_ns_pid(pid_t host_pid)
  * Writes short (12-char) container ID to out. Returns 0 on success. */
 static int get_container_id(pid_t host_pid, char *out, size_t out_len)
 {
-	char path[64];
+	char path[PATH_MAX];
 	char line[512];
-	snprintf(path, sizeof(path), "/proc/%d/cgroup", host_pid);
+	snprintf(path, sizeof(path), "%s/%d/cgroup", as_procfs_root, host_pid);
 	FILE *f = fopen(path, "r");
 	if (!f)
 		return -1;
@@ -87,11 +90,11 @@ static void print_container_fields(pid_t host_pid)
 {
 	int ns_pid = get_ns_pid(host_pid);
 	if (ns_pid > 0) {
-		printf(",\"ns_pid\":%d", ns_pid);
+		as_output_printf(",\"ns_pid\":%d", ns_pid);
 		char container_id[16];
 		if (get_container_id(host_pid, container_id, sizeof(container_id)) == 0 &&
 		    container_id[0] != '\0') {
-			printf(",\"container_id\":\"%s\"", container_id);
+			as_output_printf(",\"container_id\":\"%s\"", container_id);
 		}
 	}
 }

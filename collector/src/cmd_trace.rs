@@ -46,6 +46,8 @@ pub(crate) struct OtelConfig {
     pub(crate) endpoint: Option<String>,
     /// Opt-in: include prompt/completion content in spans.
     pub(crate) capture_content: bool,
+    /// Export correlated file/process spans instead of AgentSight-reconstructed LLM spans.
+    pub(crate) tool_enhancement: bool,
 }
 
 #[derive(Default)]
@@ -62,6 +64,14 @@ pub(crate) struct TraceConfig {
     pub(crate) process: bool,
     pub(crate) trace_net: bool,
     pub(crate) process_seed_pids: Vec<PidSeed>,
+    pub(crate) python_async_context: bool,
+    pub(crate) python_marker_library: Option<String>,
+    pub(crate) python_asyncio_lib: Option<String>,
+    pub(crate) python_runtime: Option<String>,
+    pub(crate) python_task_step_offset: Option<u64>,
+    pub(crate) python_task_init_offset: Option<u64>,
+    pub(crate) python_context_copy_offset: Option<u64>,
+    pub(crate) python_context_run_offset: Option<u64>,
     pub(crate) stdio: bool,
     pub(crate) stdio_uid: Option<u32>,
     pub(crate) stdio_comm: Option<String>,
@@ -251,9 +261,10 @@ pub(crate) fn build_trace_agent_with_view(
             })?));
     }
     if let Some(otel_config) = &cfg.otel {
-        materializer = materializer.add_view_sink(Box::new(OtelExporter::new(
+        materializer = materializer.add_view_sink(Box::new(OtelExporter::new_with_tool_enhancement(
             otel_config.endpoint.clone(),
             otel_config.capture_content,
+            otel_config.tool_enhancement,
         )));
     }
     agent = agent.add_global_analyzer(Box::new(materializer));
@@ -325,6 +336,35 @@ fn build_process_args(cfg: &TraceConfig) -> Vec<String> {
     }
     if let Some(mode) = cfg.mode {
         args.extend(["-m".to_string(), mode.to_string()]);
+    }
+    if cfg.python_async_context {
+        args.push("--python-async-context".to_string());
+    }
+    if cfg
+        .otel
+        .as_ref()
+        .is_some_and(|otel| otel.tool_enhancement)
+    {
+        args.push("--trace-fs".to_string());
+    }
+    for (flag, value) in [
+        ("--python-marker-library", cfg.python_marker_library.as_ref()),
+        ("--python-asyncio-lib", cfg.python_asyncio_lib.as_ref()),
+        ("--python-runtime", cfg.python_runtime.as_ref()),
+    ] {
+        if let Some(value) = value {
+            args.extend([flag.to_string(), value.clone()]);
+        }
+    }
+    for (flag, value) in [
+        ("--python-task-step-offset", cfg.python_task_step_offset),
+        ("--python-task-init-offset", cfg.python_task_init_offset),
+        ("--python-context-copy-offset", cfg.python_context_copy_offset),
+        ("--python-context-run-offset", cfg.python_context_run_offset),
+    ] {
+        if let Some(value) = value {
+            args.extend([flag.to_string(), value.to_string()]);
+        }
     }
     args
 }
@@ -693,6 +733,31 @@ pub(crate) async fn run_debug_runner<R: Runner>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_enhancement_enables_filesystem_tracing() {
+        let cfg = TraceConfig {
+            process: true,
+            python_async_context: true,
+            python_marker_library: Some("/opt/agentsight/libagentsight_tool_marker.so".to_string()),
+            otel: Some(OtelConfig {
+                endpoint: None,
+                capture_content: false,
+                tool_enhancement: true,
+            }),
+            ..Default::default()
+        };
+
+        let args = build_process_args(&cfg);
+        assert!(args.iter().any(|arg| arg == "--python-async-context"));
+        assert!(args.iter().any(|arg| arg == "--trace-fs"));
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--python-marker-library",
+                "/opt/agentsight/libagentsight_tool_marker.so",
+            ]
+        }));
+    }
 
     #[test]
     fn saved_capture_server_does_not_enable_live_host_apis() {

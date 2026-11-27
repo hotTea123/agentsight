@@ -90,15 +90,64 @@ static __always_inline void update_agg_map(struct agg_key *key, u64 count, u64 b
 		val->last_ts = bpf_ktime_get_ns();
 		bpf_get_current_comm(val->comm, sizeof(val->comm));
 	} else {
-		struct agg_value new_val = {};
-		new_val.count = count;
-		new_val.total_bytes = bytes;
-		new_val.first_ts = bpf_ktime_get_ns();
-		new_val.last_ts = new_val.first_ts;
-		bpf_get_current_comm(new_val.comm, sizeof(new_val.comm));
+		u32 zero = 0;
+		struct agg_value *new_val = bpf_map_lookup_elem(&agg_value_scratch, &zero);
+		if (!new_val)
+			return;
+		__builtin_memset(new_val, 0, sizeof(*new_val));
+		new_val->count = count;
+		new_val->total_bytes = bytes;
+		new_val->first_ts = bpf_ktime_get_ns();
+		new_val->last_ts = new_val->first_ts;
+		bpf_get_current_comm(new_val->comm, sizeof(new_val->comm));
 
-		if (bpf_map_update_elem(&event_agg_map, key, &new_val, BPF_NOEXIST) < 0) {
+		if (bpf_map_update_elem(&event_agg_map, key, new_val, BPF_NOEXIST) < 0) {
 			/* map full: bump overflow counter */
+			u32 zero = 0;
+			u64 *overflow = bpf_map_lookup_elem(&agg_overflow_count, &zero);
+			if (overflow)
+				__sync_fetch_and_add(overflow, 1);
+		}
+	}
+}
+
+static __noinline void update_correlated_file_agg_map(
+	struct correlated_file_key *key,
+	u64 count,
+	u64 bytes,
+	const char *extra_user_path)
+{
+	struct agg_value *val = bpf_map_lookup_elem(&correlated_file_agg_map, key);
+	if (val) {
+		__sync_fetch_and_add(&val->count, count);
+		if (bytes)
+			__sync_fetch_and_add(&val->total_bytes, bytes);
+		val->last_ts = bpf_ktime_get_ns();
+		bpf_get_current_comm(val->comm, sizeof(val->comm));
+		if (extra_user_path)
+			bpf_probe_read_user_str(val->extra, sizeof(val->extra), extra_user_path);
+	} else {
+		u32 zero = 0;
+		struct agg_value *new_val = bpf_map_lookup_elem(&agg_value_scratch, &zero);
+		if (!new_val)
+			return;
+		__builtin_memset(new_val, 0, sizeof(*new_val));
+		new_val->count = count;
+		new_val->total_bytes = bytes;
+		new_val->first_ts = bpf_ktime_get_ns();
+		new_val->last_ts = new_val->first_ts;
+		bpf_get_current_comm(new_val->comm, sizeof(new_val->comm));
+		if (extra_user_path &&
+		    bpf_probe_read_user_str(
+			new_val->extra,
+			sizeof(new_val->extra),
+			extra_user_path) < 0)
+			return;
+		if (bpf_map_update_elem(
+			&correlated_file_agg_map,
+			key,
+			new_val,
+			BPF_NOEXIST) < 0) {
 			u32 zero = 0;
 			u64 *overflow = bpf_map_lookup_elem(&agg_overflow_count, &zero);
 			if (overflow)
@@ -112,40 +161,98 @@ static __always_inline void format_fd_detail(char *buf, int buf_len, int fd)
 {
 	/* Keep LLVM from folding stack pointer arithmetic into bitwise OR. */
 	barrier_var(buf);
-	/* "fd=" prefix */
-	if (buf_len < 4) return;
-	buf[0] = 'f'; buf[1] = 'd'; buf[2] = '=';
-
-	/* Convert fd to decimal string */
-	int pos = 3;
-	bool neg = false;
-	unsigned int ufd;
+	/* Constant offsets keep older BPF verifiers away from variable stack
+	 * pointer arithmetic. File descriptors passed by these syscalls are
+	 * non-negative; retain a deterministic marker for invalid values. */
+	if (buf_len < 14)
+		return;
+	buf[0] = 'f';
+	buf[1] = 'd';
+	buf[2] = '=';
 	if (fd < 0) {
-		neg = true;
-		ufd = (unsigned int)(-fd);
-	} else {
-		ufd = (unsigned int)fd;
+		buf[3] = '-';
+		buf[4] = '1';
+		buf[5] = '\0';
+		return;
 	}
 
-	/* Write digits in reverse */
-	char digits[12];
-	int dlen = 0;
-	if (ufd == 0) {
-		digits[dlen++] = '0';
+	unsigned int value = (unsigned int)fd;
+	if (value >= 1000000000U) {
+		buf[3] = '0' + (value / 1000000000U) % 10;
+		buf[4] = '0' + (value / 100000000U) % 10;
+		buf[5] = '0' + (value / 10000000U) % 10;
+		buf[6] = '0' + (value / 1000000U) % 10;
+		buf[7] = '0' + (value / 100000U) % 10;
+		buf[8] = '0' + (value / 10000U) % 10;
+		buf[9] = '0' + (value / 1000U) % 10;
+		buf[10] = '0' + (value / 100U) % 10;
+		buf[11] = '0' + (value / 10U) % 10;
+		buf[12] = '0' + value % 10;
+		buf[13] = '\0';
+	} else if (value >= 100000000U) {
+		buf[3] = '0' + value / 100000000U;
+		buf[4] = '0' + (value / 10000000U) % 10;
+		buf[5] = '0' + (value / 1000000U) % 10;
+		buf[6] = '0' + (value / 100000U) % 10;
+		buf[7] = '0' + (value / 10000U) % 10;
+		buf[8] = '0' + (value / 1000U) % 10;
+		buf[9] = '0' + (value / 100U) % 10;
+		buf[10] = '0' + (value / 10U) % 10;
+		buf[11] = '0' + value % 10;
+		buf[12] = '\0';
+	} else if (value >= 10000000U) {
+		buf[3] = '0' + value / 10000000U;
+		buf[4] = '0' + (value / 1000000U) % 10;
+		buf[5] = '0' + (value / 100000U) % 10;
+		buf[6] = '0' + (value / 10000U) % 10;
+		buf[7] = '0' + (value / 1000U) % 10;
+		buf[8] = '0' + (value / 100U) % 10;
+		buf[9] = '0' + (value / 10U) % 10;
+		buf[10] = '0' + value % 10;
+		buf[11] = '\0';
+	} else if (value >= 1000000U) {
+		buf[3] = '0' + value / 1000000U;
+		buf[4] = '0' + (value / 100000U) % 10;
+		buf[5] = '0' + (value / 10000U) % 10;
+		buf[6] = '0' + (value / 1000U) % 10;
+		buf[7] = '0' + (value / 100U) % 10;
+		buf[8] = '0' + (value / 10U) % 10;
+		buf[9] = '0' + value % 10;
+		buf[10] = '\0';
+	} else if (value >= 100000U) {
+		buf[3] = '0' + value / 100000U;
+		buf[4] = '0' + (value / 10000U) % 10;
+		buf[5] = '0' + (value / 1000U) % 10;
+		buf[6] = '0' + (value / 100U) % 10;
+		buf[7] = '0' + (value / 10U) % 10;
+		buf[8] = '0' + value % 10;
+		buf[9] = '\0';
+	} else if (value >= 10000U) {
+		buf[3] = '0' + value / 10000U;
+		buf[4] = '0' + (value / 1000U) % 10;
+		buf[5] = '0' + (value / 100U) % 10;
+		buf[6] = '0' + (value / 10U) % 10;
+		buf[7] = '0' + value % 10;
+		buf[8] = '\0';
+	} else if (value >= 1000U) {
+		buf[3] = '0' + value / 1000U;
+		buf[4] = '0' + (value / 100U) % 10;
+		buf[5] = '0' + (value / 10U) % 10;
+		buf[6] = '0' + value % 10;
+		buf[7] = '\0';
+	} else if (value >= 100U) {
+		buf[3] = '0' + value / 100U;
+		buf[4] = '0' + (value / 10U) % 10;
+		buf[5] = '0' + value % 10;
+		buf[6] = '\0';
+	} else if (value >= 10U) {
+		buf[3] = '0' + value / 10U;
+		buf[4] = '0' + value % 10;
+		buf[5] = '\0';
 	} else {
-		while (ufd > 0 && dlen < 11) {
-			digits[dlen++] = '0' + (ufd % 10);
-			ufd /= 10;
-		}
+		buf[3] = '0' + value;
+		buf[4] = '\0';
 	}
-
-	if (neg && pos < buf_len - 1)
-		buf[pos++] = '-';
-
-	for (int i = dlen - 1; i >= 0 && pos < buf_len - 1; i--)
-		buf[pos++] = digits[i];
-
-	buf[pos] = '\0';
 }
 
 /* Format "N.N.N.N:PORT" for IPv4 addresses without bpf_snprintf */

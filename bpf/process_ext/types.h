@@ -17,6 +17,19 @@ struct agg_key {
 	char local_endpoint[DETAIL_LEN];
 };
 
+struct correlated_file_key {
+	__u32 pid;
+	__u32 tid;
+	__u32 event_type;
+	__u32 reserved;
+	__u64 task_id;
+	__u64 bound_task_id;
+	struct tool_span_context tool_context;
+	__u8 correlation_source;
+	__u8 correlation_reserved[7];
+	char filepath[MAX_FILENAME_LEN];
+};
+
 struct agg_value {
 	__u64 count;
 	__u64 total_bytes;
@@ -28,6 +41,27 @@ struct agg_value {
 
 struct exit_mem_info {
 	__u64 hiwater_rss;
+};
+
+struct pending_file_open {
+	int flags;
+	char filepath[MAX_FILENAME_LEN];
+};
+
+struct file_descriptor_key {
+	__u32 tgid;
+	int fd;
+};
+
+struct tracked_file_descriptor {
+	int flags;
+	char filepath[MAX_FILENAME_LEN];
+};
+
+struct pending_file_dup {
+	__u8 source_tracked;
+	__u8 reserved[3];
+	struct tracked_file_descriptor tracked;
 };
 
 enum process_ext_event_type {
